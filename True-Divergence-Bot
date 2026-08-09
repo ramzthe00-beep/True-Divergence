@@ -49,9 +49,15 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-API_KEY = os.getenv("API_KEY")
-API_SECRET = os.getenv("API_SECRET")
+
+# ============================================
+# API Configuration
+# ============================================
+API_KEY = os.getenv("API_KEY", "J_MHpF-VbA59rq_oZIlSwIk76MBhYm3h_Ggn3lnS")
+API_SECRET = os.getenv("API_SECRET", "eE9Ew_BHqC9x-u2TDvhhTyk8YCv5iKGP70vI6cf4")
 BASE_URL = "https://apiv2.thetruetrade.io"
+
+
 
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN","8942274184:AAFK2GbImsNiK57EyBTY702ha6GO291qPLw")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "7402770612")
