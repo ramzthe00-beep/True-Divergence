@@ -4,6 +4,8 @@ DTM v6 FC — Divergence + Golden/Death Cross Signal Bot
 ====================================================================
 نسخه اصلاح‌شده - رفع باگ‌های محاسبه استاپ و تشخیص پیوت
 + تمام امکانات DTM Hybrid (Pine-parity fixes, reporting, state persistence, etc.)
++ **NEW**: بهترین سیگنال در هر نوع (کلاسیک/مخفی/تقاطع) — حداکثر ۳ سیگنال برای هر جهت
++ **NEW**: پیگیری استاپ و تارگت با قیمت لحظه‌ای صرافی (مستقل از هیستوری)
 """
 
 import os
@@ -136,6 +138,16 @@ class TrueTradeData:
             logger.error(f"[FETCH ERROR] {symbol} ({timeframe}): {e}")
             return None
 
+    def fetch_current_price(self, symbol):
+        """دریافت قیمت لحظه‌ای از API صرافی"""
+        try:
+            df = self.fetch_ohlcv(symbol, '1m', 2)
+            if df is not None and not df.empty:
+                return df['close'].iloc[-1]
+        except:
+            pass
+        return None
+
 # =====================================================================================
 # کلاس صرافی
 # =====================================================================================
@@ -191,31 +203,6 @@ class TrueTradePrivateExchange:
             return 0
         except:
             return None
-
-    def fetch_trade_history(self, symbol=None, start_time=None, end_time=None):
-        params = {}
-        if symbol:
-            params['symbol'] = symbol.upper()
-        if start_time:
-            params['start'] = start_time
-        if end_time:
-            params['end'] = end_time
-        query_string = "&".join([f"{k}={v}" for k, v in params.items()])
-        uri = f"/futures/trades{'?' + query_string if query_string else ''}"
-        try:
-            data = self._request('GET', uri)
-            return data if isinstance(data, list) else []
-        except Exception as e:
-            logger.error(f"[TRADE HISTORY ERROR] {e}")
-            return []
-
-    def fetch_open_positions(self):
-        try:
-            data = self._request('GET', '/futures/positions?active=true')
-            return data if isinstance(data, list) else []
-        except Exception as e:
-            logger.error(f"[FETCH POSITIONS ERROR] {e}")
-            return []
 
     def create_order(self, symbol, order_type, side, capital, price=None, params=None):
         if params:
@@ -615,7 +602,7 @@ def save_history(h):
     with open(HISTORY_FILE, 'w') as f:
         json.dump(h, f, indent=2)
 
-def update_trade_result(signal_time, result, close_price, close_time, pnl=None, commission=None):
+def update_trade_result(signal_time, result, close_price, close_time, pnl=None):
     h = load_history()
     for t in h:
         if t.get('signal_time') == signal_time:
@@ -624,8 +611,6 @@ def update_trade_result(signal_time, result, close_price, close_time, pnl=None, 
             t['close_time'] = close_time
             if pnl is not None:
                 t['realized_pnl'] = pnl
-            if commission is not None:
-                t['commission'] = commission
             break
     save_history(h)
 
@@ -675,7 +660,7 @@ def process_ma_crosses(closed_df_indexed, ma_f, ma_m, ma_s, state, start_bar, en
     return events
 
 # =====================================================================================
-# تشخیص سیگنال
+# تشخیص سیگنال — بهترین سیگنال در هر نوع
 # =====================================================================================
 def detect_signal(df_1m, df_5m, state, symbol, debug=False):
     debug_log = []
@@ -769,19 +754,25 @@ def detect_signal(df_1m, df_5m, state, symbol, debug=False):
     log(f"   SSL(5m) Hlv={hlv} | gate_long={gate_long} gate_short={gate_short}")
 
     entry_price = close.iloc[-1]
-    signals = []
+
+    # ── نگهداری بهترین سیگنال در هر نوع ──────────────────────────────────
+    best_classic_bull = None  # بهترین واگرایی کلاسیک صعودی
+    best_hidden_bull = None   # بهترین واگرایی مخفی صعودی
+    best_classic_bear = None  # بهترین واگرایی کلاسیک نزولی
+    best_hidden_bear = None   # بهترین واگرایی مخفی نزولی
+    cross_signals = []        # تقاطع‌ها (هر دو می‌تونن همزمان باشن)
 
     # ── تقاطع طلایی/مرگ ─────────────────────────────────────────────────
     for etype, ets in ma_events:
         if etype == "BUY_CROSS" and gate_long:
             stop, target = compute_cross_sl_tp("long", entry_price, atr14.iloc[-1])
-            signals.append({'type': 'GOLDEN_CROSS', 'direction': 'BUY', 'entry': entry_price,
-                             'stop': stop, 'target': target, 'extra': "⬆تقاطع طلایی"})
+            cross_signals.append({'type': 'GOLDEN_CROSS', 'direction': 'BUY', 'entry': entry_price,
+                                   'stop': stop, 'target': target, 'extra': "⬆تقاطع طلایی", 'score': 0})
             log(f"   ⬆️ Golden Cross @ {ets} (gate_long=True)")
         elif etype == "SELL_CROSS" and gate_short:
             stop, target = compute_cross_sl_tp("short", entry_price, atr14.iloc[-1])
-            signals.append({'type': 'DEATH_CROSS', 'direction': 'SELL', 'entry': entry_price,
-                             'stop': stop, 'target': target, 'extra': "⬇تقاطع مرگ"})
+            cross_signals.append({'type': 'DEATH_CROSS', 'direction': 'SELL', 'entry': entry_price,
+                                   'stop': stop, 'target': target, 'extra': "⬇تقاطع مرگ", 'score': 0})
             log(f"   ⬇️ Death Cross @ {ets} (gate_short=True)")
 
     # ── واگرایی نزولی/مخفی‌نزولی ────────────────────────────────────────
@@ -808,27 +799,26 @@ def detect_signal(df_1m, df_5m, state, symbol, debug=False):
                 div_macd = p2['macdline'] < p1['macdline']
             elif p2['price'] < p1['price']:
                 hid = p2['rsi'] > p1['rsi'] or p2['macdline'] > p1['macdline']
-            if div_rsi or div_macd or div_hist:
+
+            if (div_rsi or div_macd or div_hist) and gate_short:
                 fib_ok = check_fib_near(high, low, confirm_bar2, p2['price'], is_high_side=True)
                 pa_ok = check_shooting_star(closed_df, bar2)
                 score = sum([div_rsi, div_hist, div_macd, fib_ok, pa_ok])
-                if score >= MIN_CLASSIC_SCORE and gate_short:
+                if score >= MIN_CLASSIC_SCORE:
                     stop, target = compute_divergence_sl_tp(p1['price'], p2['price'], "short", entry_price, atr14.iloc[-1])
                     if stop and target:
-                        signals.append({'type': 'CLASSIC_BEARISH_DIV', 'direction': 'SELL', 'entry': entry_price,
-                                         'stop': stop, 'target': target,
-                                         'extra': f"{score_stars(score)}\nواگرایی↓[{score}/5]"})
-                        log(f"   🔴 Classic Bearish Div score={score}/5 (gate_short=True)")
-                        break
-                else:
-                    log(f"   🔴 Classic Bearish Div score={score}/5 — رد شد")
+                        sig = {'type': 'CLASSIC_BEARISH_DIV', 'direction': 'SELL', 'entry': entry_price,
+                                'stop': stop, 'target': target,
+                                'extra': f"{score_stars(score)}\nواگرایی↓[{score}/5]", 'score': score}
+                        if best_classic_bear is None or score > best_classic_bear['score']:
+                            best_classic_bear = sig
             if hid and gate_short:
                 stop, target = compute_divergence_sl_tp(p1['price'], p2['price'], "short", entry_price, atr14.iloc[-1])
                 if stop and target:
-                    signals.append({'type': 'HIDDEN_BEARISH_DIV', 'direction': 'SELL', 'entry': entry_price,
-                                     'stop': stop, 'target': target, 'extra': "~واگرایی مخفی↓"})
-                    log(f"   🟠 Hidden Bearish Div (gate_short=True)")
-                    break
+                    sig = {'type': 'HIDDEN_BEARISH_DIV', 'direction': 'SELL', 'entry': entry_price,
+                            'stop': stop, 'target': target, 'extra': "~واگرایی مخفی↓", 'score': 0}
+                    if best_hidden_bear is None:
+                        best_hidden_bear = sig
 
     # ── واگرایی صعودی/مخفی‌صعودی ────────────────────────────────────────
     for new_pl in new_pivots_low:
@@ -854,150 +844,177 @@ def detect_signal(df_1m, df_5m, state, symbol, debug=False):
                 div_macd = p2['macdline'] > p1['macdline']
             elif p2['price'] > p1['price']:
                 hid = p2['rsi'] < p1['rsi'] or p2['macdline'] < p1['macdline']
-            if div_rsi or div_macd or div_hist:
+
+            if (div_rsi or div_macd or div_hist) and gate_long:
                 fib_ok = check_fib_near(high, low, confirm_bar2, p2['price'], is_high_side=False)
                 pa_ok = check_hammer(closed_df, bar2)
                 score = sum([div_rsi, div_hist, div_macd, fib_ok, pa_ok])
-                if score >= MIN_CLASSIC_SCORE and gate_long:
+                if score >= MIN_CLASSIC_SCORE:
                     stop, target = compute_divergence_sl_tp(p1['price'], p2['price'], "long", entry_price, atr14.iloc[-1])
                     if stop and target:
-                        signals.append({'type': 'CLASSIC_BULLISH_DIV', 'direction': 'BUY', 'entry': entry_price,
-                                         'stop': stop, 'target': target,
-                                         'extra': f"{score_stars(score)}\nواگرایی↑[{score}/5]"})
-                        log(f"   🟢 Classic Bullish Div score={score}/5 (gate_long=True)")
-                        break
-                else:
-                    log(f"   🟢 Classic Bullish Div score={score}/5 — رد شد")
+                        sig = {'type': 'CLASSIC_BULLISH_DIV', 'direction': 'BUY', 'entry': entry_price,
+                                'stop': stop, 'target': target,
+                                'extra': f"{score_stars(score)}\nواگرایی↑[{score}/5]", 'score': score}
+                        if best_classic_bull is None or score > best_classic_bull['score']:
+                            best_classic_bull = sig
             if hid and gate_long:
                 stop, target = compute_divergence_sl_tp(p1['price'], p2['price'], "long", entry_price, atr14.iloc[-1])
                 if stop and target:
-                    signals.append({'type': 'HIDDEN_BULLISH_DIV', 'direction': 'BUY', 'entry': entry_price,
-                                     'stop': stop, 'target': target, 'extra': "~واگرایی مخفی↑"})
-                    log(f"   🔵 Hidden Bullish Div (gate_long=True)")
-                    break
+                    sig = {'type': 'HIDDEN_BULLISH_DIV', 'direction': 'BUY', 'entry': entry_price,
+                            'stop': stop, 'target': target, 'extra': "~واگرایی مخفی↑", 'score': 0}
+                    if best_hidden_bull is None:
+                        best_hidden_bull = sig
+
+    # ── جمع‌آوری نهایی سیگنال‌ها ─────────────────────────────────────────
+    signals = []
+    for sig in [best_classic_bull, best_hidden_bull, best_classic_bear, best_hidden_bear]:
+        if sig is not None:
+            signals.append(sig)
+    signals.extend(cross_signals)
 
     if not signals:
         log("   ⚪ No signal")
+    else:
+        log(f"   📊 Total signals: {len(signals)} "
+            f"(ClassicBull={best_classic_bull is not None}, HiddenBull={best_hidden_bull is not None}, "
+            f"ClassicBear={best_classic_bear is not None}, HiddenBear={best_hidden_bear is not None}, "
+            f"Cross={len(cross_signals)})")
 
     return signals, debug_log
 
 # =====================================================================================
-# پیگیری سیگنال‌های باز
+# پیگیری سیگنال‌های باز — با قیمت لحظه‌ای صرافی (مستقل از هیستوری)
 # =====================================================================================
-def track_open_signals(exchange):
+def track_open_signals(data):
     history = load_history()
-    open_trades_in_history = [t for t in history if t.get('result') is None]
-    if not open_trades_in_history:
-        return
-    try:
-        open_positions = exchange.fetch_open_positions()
-    except Exception as e:
-        logger.error(f"[TRACK] Could not fetch open positions: {e}")
+    open_trades = [t for t in history if t.get('result') is None]
+
+    if not open_trades:
         return
 
-    side_normalize = {"BUY": "LONG", "LONG": "LONG", "SELL": "SHORT", "SHORT": "SHORT"}
-
-    for trade in open_trades_in_history:
-        symbol = trade['symbol'].upper()
-        raw_direction = str(trade.get('direction', '')).upper()
-        direction_norm = side_normalize.get(raw_direction, raw_direction)
+    for trade in open_trades:
+        symbol = trade['symbol']
+        direction = trade['direction']
+        entry = trade['entry_price']
+        stop = trade['stop_loss']
+        target = trade['take_profit']
         signal_time = trade['signal_time']
+        signal_number = trade.get('signal_number', '?')
 
-        matching_open_pos = None
-        if isinstance(open_positions, list):
-            for pos in open_positions:
-                pos_symbol = str(pos.get('symbol', '')).upper()
-                pos_side = side_normalize.get(str(pos.get('side', '')).upper(), '')
-                if pos_symbol == symbol and pos_side == direction_norm:
-                    matching_open_pos = pos
-                    break
-
-        if matching_open_pos is not None:
+        # دریافت قیمت لحظه‌ای
+        cp = data.fetch_current_price(symbol)
+        if cp is None:
             continue
 
-        try:
-            now_utc = datetime.now(timezone.utc)
-            today_start = now_utc.replace(hour=0, minute=0, second=0, microsecond=0).strftime('%Y-%m-%dT%H:%M:%SZ')
-            trades = exchange.fetch_trade_history(symbol=symbol, start_time=today_start)
-            last_closed_trade = None
-            if isinstance(trades, list):
-                for t in reversed(trades):
-                    if str(t.get('symbol', '')).upper() == symbol:
-                        last_closed_trade = t
-                        break
-            if last_closed_trade:
-                realized_pnl = float(last_closed_trade.get('realizedPnl', 0))
-                close_price = float(last_closed_trade.get('price', 0))
-                if realized_pnl > 0:
-                    result = 'TAKE_PROFIT'
-                    message = f"🎯 حد سود فعال شد {HASHTAGS['target']} #سیگنال_{trade.get('signal_number', '?')}\n\n🔹 {symbol} | {direction_norm}\n💰 سود خالص: {realized_pnl:.2f} USDT\n🕒 {format_iran_time()}"
-                else:
-                    result = 'STOP_LOSS'
-                    message = f"💔 حد ضرر فعال شد {HASHTAGS['stop']} #سیگنال_{trade.get('signal_number', '?')}\n\n🔹 {symbol} | {direction_norm}\n💸 ضرر خالص: {realized_pnl:.2f} USDT\n🕒 {format_iran_time()}"
-                update_trade_result(signal_time, result, close_price, format_iran_time(), pnl=realized_pnl)
-                send_telegram_message(message)
-                logger.info(f"[TRACK] Closed trade detected for {symbol} {direction_norm}: {result}, PnL: {realized_pnl}")
-        except Exception as e:
-            logger.error(f"[TRACK] Error checking closed trade history for {symbol}: {e}")
+        hit_target = False
+        hit_stop = False
+
+        if direction == 'BUY':
+            if cp >= target:
+                hit_target = True
+            elif cp <= stop:
+                hit_stop = True
+        else:  # SELL
+            if cp <= target:
+                hit_target = True
+            elif cp >= stop:
+                hit_stop = True
+
+        if hit_target:
+            profit_pct = (target - entry) / entry * 100 if direction == 'BUY' else (entry - target) / entry * 100
+            leverage = trade.get('leverage', 1)
+            capital = trade.get('capital', 0)
+            profit_usdt = capital * leverage * profit_pct / 100
+
+            update_trade_result(signal_time, 'TAKE_PROFIT', cp, format_iran_time(), pnl=profit_usdt)
+            send_telegram_message(
+                f"🎯 حد سود فعال شد {HASHTAGS['target']} #Signal_{signal_number}\n\n"
+                f"🔹 {symbol} | {direction}\n"
+                f"💰 سود: +{profit_pct:.2f}% | +{profit_usdt:.2f} USDT\n"
+                f"🕒 {format_iran_time()}"
+            )
+            logger.info(f"[TRACK] TAKE_PROFIT: {symbol} {direction} | PnL: +{profit_usdt:.2f} USDT")
+
+        elif hit_stop:
+            loss_pct = (entry - stop) / entry * 100 if direction == 'BUY' else (stop - entry) / entry * 100
+            leverage = trade.get('leverage', 1)
+            capital = trade.get('capital', 0)
+            loss_usdt = capital * leverage * loss_pct / 100
+
+            update_trade_result(signal_time, 'STOP_LOSS', cp, format_iran_time(), pnl=-loss_usdt)
+            send_telegram_message(
+                f"💔 حد ضرر فعال شد {HASHTAGS['stop']} #Signal_{signal_number}\n\n"
+                f"🔹 {symbol} | {direction}\n"
+                f"💸 ضرر: -{loss_pct:.2f}% | -{loss_usdt:.2f} USDT\n"
+                f"🕒 {format_iran_time()}"
+            )
+            logger.info(f"[TRACK] STOP_LOSS: {symbol} {direction} | PnL: -{loss_usdt:.2f} USDT")
 
 # =====================================================================================
 # توابع گزارش
 # =====================================================================================
 def send_reports(exchange):
     now = datetime.now(timezone(timedelta(hours=3, minutes=30)))
+    today_str = format_iran_date()
+
+    # گزارش محلی
     try:
-        today_str = format_iran_date()
         history = load_history()
         today_trades = [t for t in history if t.get('signal_time', '').startswith(today_str)]
         if today_trades:
             total = len(today_trades)
             wins = len([t for t in today_trades if t.get('result') == 'TAKE_PROFIT'])
             losses = len([t for t in today_trades if t.get('result') == 'STOP_LOSS'])
+            open_count = len([t for t in today_trades if t.get('result') is None])
             closed = wins + losses
             win_rate = (wins / closed * 100) if closed > 0 else 0
-            local_daily_msg = f"""📊 گزارش روزانه (محلی) — {today_str} {HASHTAGS['daily']}
+            local_daily_msg = f"""📊 گزارش روزانه — {today_str} {HASHTAGS['daily']}
 ━━━━━━━━━━━━━━━━━━━━━━
 📈 کل معاملات: {total} عدد
 ✅ موفق: {wins} ({win_rate:.1f}%)
 ❌ ناموفق: {losses}
+⏳ باز: {open_count}
 📊 نرخ موفقیت: {win_rate:.1f}%
 ━━━━━━━━━━━━━━━━━━━━━━
 🕒 {format_iran_time()}"""
             send_telegram_message(local_daily_msg)
     except Exception as e:
         logger.error(f"[REPORT ERROR] Local daily: {e}")
+
+    # گزارش ماهانه
     try:
-        now_utc = datetime.now(timezone.utc)
-        today_start = now_utc.replace(hour=0, minute=0, second=0, microsecond=0).strftime('%Y-%m-%dT%H:%M:%SZ')
-        today_end = now_utc.strftime('%Y-%m-%dT%H:%M:%SZ')
-        exchange_trades_today = exchange.fetch_trade_history(start_time=today_start, end_time=today_end)
-        current_balance = exchange.fetch_balance()
-        if isinstance(exchange_trades_today, list) and exchange_trades_today:
-            total_realized_pnl = sum(float(t.get('realizedPnl', 0)) for t in exchange_trades_today)
-            wins = len([t for t in exchange_trades_today if float(t.get('realizedPnl', 0)) > 0])
-            losses = len([t for t in exchange_trades_today if float(t.get('realizedPnl', 0)) < 0])
-            total_trades = len(exchange_trades_today)
+        history = load_history()
+        month_ago = (now - timedelta(days=30)).strftime('%Y-%m-%d')
+        month_trades = [t for t in history if t.get('signal_time', '') >= month_ago]
+        if month_trades:
+            total = len(month_trades)
+            wins = len([t for t in month_trades if t.get('result') == 'TAKE_PROFIT'])
+            losses = len([t for t in month_trades if t.get('result') == 'STOP_LOSS'])
+            total_pnl = sum(t.get('realized_pnl', 0) for t in month_trades if t.get('realized_pnl'))
             win_rate = (wins / (wins + losses) * 100) if (wins + losses) > 0 else 0
-            exchange_report_msg = f"""📈 گزارش واقعی صرافی — {format_iran_date()} {HASHTAGS['daily']}
+            monthly_msg = f"""📈 گزارش ۳۰ روز گذشته {HASHTAGS['monthly']}
 ━━━━━━━━━━━━━━━━━━━━━━
-💰 موجودی حساب: {current_balance:.2f} USDT
-📊 کل معاملات بسته شده: {total_trades} عدد
-✅ سودآور: {wins} ({win_rate:.1f}%)
-❌ ضررده: {losses}
-💵 سود/زیان خالص: {total_realized_pnl:.2f} USDT
+📊 کل معاملات: {total} عدد
+✅ موفق: {wins} ({win_rate:.1f}%)
+❌ ناموفق: {losses}
+💰 سود/زیان خالص: {total_pnl:.2f} USDT
 📈 نرخ موفقیت: {win_rate:.1f}%
 ━━━━━━━━━━━━━━━━━━━━━━
 🕒 {format_iran_time()}"""
-        else:
-            exchange_report_msg = f"""📈 گزارش واقعی صرافی — {format_iran_date()} {HASHTAGS['daily']}
+            send_telegram_message(monthly_msg)
+    except Exception as e:
+        logger.error(f"[REPORT ERROR] Monthly: {e}")
+
+    # گزارش از صرافی
+    try:
+        current_balance = exchange.fetch_balance()
+        exchange_report_msg = f"""📈 وضعیت حساب — {today_str} {HASHTAGS['daily']}
 ━━━━━━━━━━━━━━━━━━━━━━
 💰 موجودی حساب: {current_balance:.2f} USDT
-📊 امروز معامله بسته شده‌ای نداشته‌اید.
-━━━━━━━━━━━━━━━━━━━━━━
 🕒 {format_iran_time()}"""
         send_telegram_message(exchange_report_msg)
     except Exception as e:
-        logger.error(f"[REPORT ERROR] Exchange-based: {e}")
+        logger.error(f"[REPORT ERROR] Exchange: {e}")
 
 # =====================================================================================
 # Startup Diagnostic
@@ -1073,7 +1090,7 @@ def analyze_and_execute():
         send_telegram_message(f"🔄 تغییر وضعیت صرافی {HASHTAGS['connection_change']}\n\n{status_text}{balance_text}\n🕒 {format_iran_time()}")
 
     data = TrueTradeData()
-    track_open_signals(exchange)
+    track_open_signals(data)  # پیگیری با قیمت لحظه‌ای
 
     side_map = {"BUY": "LONG", "SELL": "SHORT"}
 
@@ -1154,6 +1171,18 @@ def analyze_and_execute():
                         pass
                 time.sleep(0.5)
 
+                # ذخیره در تاریخچه (قبل از ثبت سفارش)
+                history = load_history()
+                history.append({
+                    'symbol': symbol, 'direction': direction,
+                    'entry_price': entry, 'stop_loss': stop, 'take_profit': target,
+                    'signal_time': format_iran_time(), 'result': None,
+                    'type': sig['type'], 'capital': capital,
+                    'leverage': int(used_leverage), 'qty': qty,
+                    'signal_number': signal_number
+                })
+                save_history(history)
+
                 if exchange.connected:
                     try:
                         order_result = exchange.create_order(symbol, "market", side_map[direction], capital, None,
@@ -1161,15 +1190,10 @@ def analyze_and_execute():
                         position_id = order_result.get('id', 'N/A')
 
                         history = load_history()
-                        history.append({
-                            'symbol': symbol, 'direction': direction,
-                            'entry_price': entry, 'stop_loss': stop, 'take_profit': target,
-                            'signal_time': format_iran_time(), 'result': None,
-                            'type': sig['type'], 'capital': capital,
-                            'leverage': int(used_leverage), 'qty': qty,
-                            'signal_number': signal_number,
-                            'position_id': position_id
-                        })
+                        for t in history:
+                            if t.get('signal_time') == trade_record['signal_time']:
+                                t['position_id'] = position_id
+                                break
                         save_history(history)
 
                         order_message = (
@@ -1201,6 +1225,7 @@ def analyze_and_execute():
 def main_loop():
     exchange = TrueTradePrivateExchange(API_KEY, API_SECRET, BASE_URL)
     last_daily_report_date = None
+    last_monthly_report_date = None
 
     while True:
         try:
@@ -1208,10 +1233,20 @@ def main_loop():
             analyze_and_execute()
 
             today = format_iran_date()
+            now = datetime.now(timezone(timedelta(hours=3, minutes=30)))
+
             if last_daily_report_date != today:
                 try:
                     send_reports(exchange)
                     last_daily_report_date = today
+                    last_monthly_report_date = now
+                except Exception as e:
+                    logger.error(f"[REPORT ERROR] {e}")
+
+            if last_monthly_report_date is None or (now - last_monthly_report_date).days >= 30:
+                try:
+                    send_reports(exchange)
+                    last_monthly_report_date = now
                 except Exception as e:
                     logger.error(f"[REPORT ERROR] {e}")
 
@@ -1237,7 +1272,9 @@ if __name__ == "__main__":
         f"🧠 سیگنال‌ها: واگرایی کلاسیک(≥۲★)/مخفی + تقاطع طلایی/مرگ\n"
         f"🔷 همه با گیت فیلتر SSL Hybrid (5m)\n"
         f"⚙️ Pivot: {LEFT_BARS}/{RIGHT_BARS} | تاریخچه: {HISTORY_BARS} کندل\n"
-        f"🎯 تارگت: همیشه RR={TARGET_RR}\n\n"
+        f"🎯 تارگت: همیشه RR={TARGET_RR}\n"
+        f"📊 بهترین سیگنال در هر نوع (حداکثر ۳ سیگنال در هر جهت)\n"
+        f"🔍 پیگیری با قیمت لحظه‌ای صرافی\n\n"
         f"📌 هشتگ‌های ثابت:\n{hashtag_list}\n\n"
         f"📊 شمارنده سیگنال: از #Signal_{SIGNAL_COUNTER + 1} شروع می‌شود\n\n"
         f"🕒 {format_iran_time()}"
