@@ -1301,4 +1301,6 @@ if __name__ == "__main__":
     )
     run_startup_diagnostic()
     threading.Thread(target=lambda: app.run(host="0.0.0.0", port=10000), daemon=True).start()
-    main_loop()
+    main_loop()· روند فعلی (کندل باز) رو نادیده می‌گیره
+· فقط روندهای بسته‌شده رو بررسی می‌کنه
+· به ۳ روند آخر نگاه می‌کنه و الگوی [1, -1, 1] یا [-1, 1, -1] رو چک می‌کنه
