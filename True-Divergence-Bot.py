@@ -7,6 +7,10 @@ DTM v6 FC — Divergence + Golden/Death Cross Signal Bot
 + **NEW**: بهترین سیگنال در هر نوع (کلاسیک/مخفی/تقاطع) — حداکثر ۳ سیگنال برای هر جهت
 + **NEW**: پیگیری استاپ و تارگت با قیمت لحظه‌ای صرافی (مستقل از هیستوری)
 + **FIXED**: فقط دو پیوت آخر (پشت سر هم) برای واگرایی مقایسه میشن (مثل Pine)
++ **FIXED**: جلوگیری از شناسایی پیوت‌های تکراری با شرط ts > last_processed_ts
++ **NEW**: شناسه یکتا (MD5) برای جلوگیری از ارسال سیگنال تکراری
++ **NEW**: دریافت ۱۰ معامله آخر صرافی در startup
++ **FIXED**: ذخیره و بازیابی last_ma_ts برای جلوگیری از تکرار تقاطع‌های قدیمی
 """
 
 import os
@@ -46,6 +50,7 @@ if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
 
 HISTORY_FILE = "trades_history_dtm_v6.json"
 STATE_FILE = "pivot_state_dtm_v6.json"
+SENT_SIGNALS_FILE = "sent_signals_dtm_v6.json"
 
 # =====================================================================================
 # هشتگ‌ها
@@ -67,6 +72,7 @@ HASHTAGS = {
     "connection": "#Connected",
     "connection_change": "#Reconnected",
     "capital_reduced": "#LowCapital",
+    "trade_history": "#TradeHistory",
 }
 
 # =====================================================================================
@@ -205,6 +211,54 @@ class TrueTradePrivateExchange:
         except:
             return None
 
+    def fetch_trade_history(self, symbol=None, start_time=None, end_time=None):
+        params = {}
+        if symbol:
+            params['symbol'] = symbol.upper()
+        if start_time:
+            params['start'] = start_time
+        if end_time:
+            params['end'] = end_time
+        query_string = "&".join([f"{k}={v}" for k, v in params.items()])
+        uri = f"/futures/trades{'?' + query_string if query_string else ''}"
+        try:
+            data = self._request('GET', uri)
+            return data if isinstance(data, list) else []
+        except Exception as e:
+            logger.error(f"[TRADE HISTORY ERROR] {e}")
+            return []
+
+    def fetch_recent_trades(self, limit=10):
+        """دریافت آخرین معاملات بسته‌شده از صرافی"""
+        try:
+            now_utc = datetime.now(timezone.utc)
+            start_time = (now_utc - timedelta(days=7)).strftime('%Y-%m-%dT%H:%M:%SZ')
+            end_time = now_utc.strftime('%Y-%m-%dT%H:%M:%SZ')
+            
+            trades = self.fetch_trade_history(start_time=start_time, end_time=end_time)
+            
+            if not isinstance(trades, list):
+                return None, "پاسخ API صرافی یک لیست معتبر نیست"
+            
+            if len(trades) == 0:
+                return [], None
+            
+            sorted_trades = sorted(trades, key=lambda x: x.get('createdAt', x.get('time', '')), reverse=True)
+            closed_trades = [t for t in sorted_trades if float(t.get('realizedPnl', 0)) != 0]
+            
+            return closed_trades[:limit], None
+            
+        except Exception as e:
+            error_msg = str(e)
+            if hasattr(self, '_last_response'):
+                try:
+                    error_body = self._last_response.text[:500]
+                    status_code = self._last_response.status_code
+                    error_msg = f"Status: {status_code}\nBody: {error_body}"
+                except:
+                    pass
+            return None, error_msg
+
     def create_order(self, symbol, order_type, side, capital, price=None, params=None):
         if params:
             if 'stopLoss' in params:
@@ -287,6 +341,30 @@ def round_price(price, symbol):
     tick = TICK_SIZES.get(symbol.upper(), 0.01)
     precision = PRICE_PRECISION.get(symbol.upper(), 2)
     return round(round(price / tick) * tick, precision)
+
+# =====================================================================================
+# مدیریت سیگنال‌های ارسال‌شده (جلوگیری از تکرار)
+# =====================================================================================
+def load_sent_signals():
+    if os.path.exists(SENT_SIGNALS_FILE):
+        try:
+            with open(SENT_SIGNALS_FILE) as f:
+                return set(json.load(f))
+        except:
+            return set()
+    return set()
+
+def save_sent_signals(sent_signals):
+    signals_list = list(sent_signals)
+    if len(signals_list) > 200:
+        signals_list = signals_list[-200:]
+    with open(SENT_SIGNALS_FILE, 'w') as f:
+        json.dump(signals_list, f)
+
+def generate_signal_id(sig):
+    """ایجاد شناسه یکتا برای سیگنال"""
+    sig_str = f"{sig['type']}_{sig['direction']}_{sig['entry']:.6f}_{sig['stop']:.6f}_{sig['target']:.6f}"
+    return hashlib.md5(sig_str.encode()).hexdigest()[:10]
 
 # =====================================================================================
 # توابع محاسباتی پایه (Pine-Exact)
@@ -522,7 +600,7 @@ def score_stars(score):
     return "★"
 
 # =====================================================================================
-# کلاس وضعیت (با state persistence)
+# کلاس وضعیت (با state persistence) — FIXED: last_ma_ts ذخیره و بازیابی میشه
 # =====================================================================================
 class SymbolState:
     def __init__(self):
@@ -546,6 +624,7 @@ class SymbolState:
                           'hist': p.get('hist', 0), 'bar': p.get('bar', 0)}
                          for p in self.pivot_lows[-200:]],
             'last_processed_ts': str(self.last_processed_ts) if self.last_processed_ts else None,
+            'last_ma_ts': str(self.last_ma_ts) if self.last_ma_ts else None,
             'telegram_log_count': self.telegram_log_count,
             'last_telegram_log_time': self.last_telegram_log_time
         }
@@ -563,6 +642,7 @@ class SymbolState:
                                 'hist': p.get('hist', 0), 'bar': p.get('bar', 0)}
                                for p in data.get('pivot_lows', [])]
             state.last_processed_ts = pd.Timestamp(data['last_processed_ts']) if data.get('last_processed_ts') else None
+            state.last_ma_ts = pd.Timestamp(data['last_ma_ts']) if data.get('last_ma_ts') else None
             state.telegram_log_count = data.get('telegram_log_count', 0)
             state.last_telegram_log_time = data.get('last_telegram_log_time', 0)
         return state
@@ -722,10 +802,14 @@ def detect_signal(df_1m, df_5m, state, symbol, debug=False):
     new_pivots_high, new_pivots_low = [], []
     for i in range(start_bar, last_valid_pivot_index + 1):
         ts = closed_df_indexed.index[i]
-        if not pd.isna(pivot_high.iloc[i]) and ts not in existing_high_ts:
+        
+        # FIXED: چک اضافه که پیوت قبلاً پردازش نشده باشد
+        is_new = (state.last_processed_ts is None or ts > state.last_processed_ts)
+        
+        if not pd.isna(pivot_high.iloc[i]) and ts not in existing_high_ts and is_new:
             new_pivots_high.append({'ts': ts, 'price': pivot_high.iloc[i], 'bar': i,
                                      'rsi': rsi_val.iloc[i], 'macdline': macd_line.iloc[i], 'hist': hist_line.iloc[i]})
-        if not pd.isna(pivot_low.iloc[i]) and ts not in existing_low_ts:
+        if not pd.isna(pivot_low.iloc[i]) and ts not in existing_low_ts and is_new:
             new_pivots_low.append({'ts': ts, 'price': pivot_low.iloc[i], 'bar': i,
                                     'rsi': rsi_val.iloc[i], 'macdline': macd_line.iloc[i], 'hist': hist_line.iloc[i]})
 
@@ -757,11 +841,11 @@ def detect_signal(df_1m, df_5m, state, symbol, debug=False):
     entry_price = close.iloc[-1]
 
     # ── نگهداری بهترین سیگنال در هر نوع ──────────────────────────────────
-    best_classic_bull = None  # بهترین واگرایی کلاسیک صعودی
-    best_hidden_bull = None   # بهترین واگرایی مخفی صعودی
-    best_classic_bear = None  # بهترین واگرایی کلاسیک نزولی
-    best_hidden_bear = None   # بهترین واگرایی مخفی نزولی
-    cross_signals = []        # تقاطع‌ها (هر دو می‌تونن همزمان باشن)
+    best_classic_bull = None
+    best_hidden_bull = None
+    best_classic_bear = None
+    best_hidden_bear = None
+    cross_signals = []
 
     # ── تقاطع طلایی/مرگ ─────────────────────────────────────────────────
     for etype, ets in ma_events:
@@ -784,7 +868,6 @@ def detect_signal(df_1m, df_5m, state, symbol, debug=False):
         if idx is None or idx < 1:
             continue
         
-        # FIXED: فقط پیوت قبلی (دقیقاً پشت سر هم، مثل Pine)
         p1 = state.pivot_highs[idx - 1]
         p2 = state.pivot_highs[idx]
         
@@ -836,7 +919,6 @@ def detect_signal(df_1m, df_5m, state, symbol, debug=False):
         if idx is None or idx < 1:
             continue
         
-        # FIXED: فقط پیوت قبلی (دقیقاً پشت سر هم، مثل Pine)
         p1 = state.pivot_lows[idx - 1]
         p2 = state.pivot_lows[idx]
         
@@ -916,7 +998,6 @@ def track_open_signals(data):
         signal_time = trade['signal_time']
         signal_number = trade.get('signal_number', '?')
 
-        # دریافت قیمت لحظه‌ای
         cp = data.fetch_current_price(symbol)
         if cp is None:
             continue
@@ -929,7 +1010,7 @@ def track_open_signals(data):
                 hit_target = True
             elif cp <= stop:
                 hit_stop = True
-        else:  # SELL
+        else:
             if cp <= target:
                 hit_target = True
             elif cp >= stop:
@@ -972,7 +1053,6 @@ def send_reports(exchange):
     now = datetime.now(timezone(timedelta(hours=3, minutes=30)))
     today_str = format_iran_date()
 
-    # گزارش محلی
     try:
         history = load_history()
         today_trades = [t for t in history if t.get('signal_time', '').startswith(today_str)]
@@ -996,7 +1076,6 @@ def send_reports(exchange):
     except Exception as e:
         logger.error(f"[REPORT ERROR] Local daily: {e}")
 
-    # گزارش ماهانه
     try:
         history = load_history()
         month_ago = (now - timedelta(days=30)).strftime('%Y-%m-%d')
@@ -1020,7 +1099,6 @@ def send_reports(exchange):
     except Exception as e:
         logger.error(f"[REPORT ERROR] Monthly: {e}")
 
-    # گزارش از صرافی
     try:
         current_balance = exchange.fetch_balance()
         exchange_report_msg = f"""📈 وضعیت حساب — {today_str} {HASHTAGS['daily']}
@@ -1030,6 +1108,77 @@ def send_reports(exchange):
         send_telegram_message(exchange_report_msg)
     except Exception as e:
         logger.error(f"[REPORT ERROR] Exchange: {e}")
+
+# =====================================================================================
+# دریافت ۱۰ معامله آخر صرافی
+# =====================================================================================
+def fetch_and_report_recent_trades(exchange):
+    """دریافت ۱۰ معامله آخر صرافی و ارسال گزارش به تلگرام"""
+    trades, error = exchange.fetch_recent_trades(10)
+    
+    if error is not None:
+        error_msg = (
+            f"⚠️ خطا در دریافت تاریخچه معاملات {HASHTAGS['trade_history']}\n"
+            f"━━━━━━━━━━━━━━━━━━━━━━\n"
+            f"📝 متن خطا:\n```\n{error}\n```\n"
+            f"━━━━━━━━━━━━━━━━━━━━━━\n"
+            f"🕒 {format_iran_time()}"
+        )
+        send_telegram_message(error_msg)
+        logger.error(f"[TRADE HISTORY] Failed to fetch: {error}")
+        return
+    
+    if trades is None or len(trades) == 0:
+        send_telegram_message(
+            f"📊 تاریخچه معاملات {HASHTAGS['trade_history']}\n"
+            f"━━━━━━━━━━━━━━━━━━━━━━\n"
+            f"📝 هیچ معامله بسته‌شده‌ای در ۷ روز اخیر یافت نشد.\n"
+            f"━━━━━━━━━━━━━━━━━━━━━━\n"
+            f"🕒 {format_iran_time()}"
+        )
+        return
+    
+    total_pnl = 0
+    report_lines = []
+    
+    for i, t in enumerate(trades[:10], 1):
+        symbol = t.get('symbol', 'N/A')
+        side = t.get('side', 'N/A')
+        realized_pnl = float(t.get('realizedPnl', 0))
+        created_at = t.get('createdAt', t.get('time', 'N/A'))
+        
+        try:
+            if created_at != 'N/A':
+                dt = pd.Timestamp(created_at)
+                if dt.tzinfo is not None:
+                    dt = dt.tz_convert(timezone(timedelta(hours=3, minutes=30)))
+                created_str = dt.strftime('%Y-%m-%d %H:%M')
+            else:
+                created_str = 'N/A'
+        except:
+            created_str = str(created_at)[:16]
+        
+        total_pnl += realized_pnl
+        
+        emoji = "🟢" if realized_pnl > 0 else "🔴" if realized_pnl < 0 else "⚪"
+        direction = "LONG" if side.upper() == "LONG" else "SHORT" if side.upper() == "SHORT" else side
+        
+        report_lines.append(
+            f"{i}. {emoji} {symbol} | {direction}\n"
+            f"   📅 {created_str} | 💰 {realized_pnl:+.2f} USDT"
+        )
+    
+    report_msg = (
+        f"📊 ۱۰ معامله آخر صرافی {HASHTAGS['trade_history']}\n"
+        f"━━━━━━━━━━━━━━━━━━━━━━\n"
+        f"{chr(10).join(report_lines)}\n"
+        f"━━━━━━━━━━━━━━━━━━━━━━\n"
+        f"💵 مجموع سود/زیان: {total_pnl:+.2f} USDT\n"
+        f"🕒 {format_iran_time()}"
+    )
+    
+    send_telegram_message(report_msg)
+    logger.info(f"[TRADE HISTORY] Reported {len(trades[:10])} recent trades, total PnL: {total_pnl:+.2f}")
 
 # =====================================================================================
 # Startup Diagnostic
@@ -1105,9 +1254,12 @@ def analyze_and_execute():
         send_telegram_message(f"🔄 تغییر وضعیت صرافی {HASHTAGS['connection_change']}\n\n{status_text}{balance_text}\n🕒 {format_iran_time()}")
 
     data = TrueTradeData()
-    track_open_signals(data)  # پیگیری با قیمت لحظه‌ای
+    track_open_signals(data)
 
     side_map = {"BUY": "LONG", "SELL": "SHORT"}
+    
+    # بارگذاری سیگنال‌های ارسال‌شده
+    sent_signals = load_sent_signals()
 
     for symbol in SYMBOLS:
         try:
@@ -1122,6 +1274,14 @@ def analyze_and_execute():
             signals, debug_log = detect_signal(df_1m, df_5m, SYMBOL_STATES[symbol], symbol, debug=True)
 
             for sig in signals:
+                # ایجاد شناسه یکتا
+                sig_id = generate_signal_id(sig)
+                
+                # اگر قبلاً ارسال شده،跳过
+                if sig_id in sent_signals:
+                    logger.info(f"[SKIP] Duplicate signal {sig_id} for {symbol}")
+                    continue
+                
                 entry = round_price(sig['entry'], symbol)
                 stop = round_price(sig['stop'], symbol)
                 target = round_price(sig['target'], symbol)
@@ -1157,7 +1317,6 @@ def analyze_and_execute():
                 qty = (capital * used_leverage) / entry
                 potential_profit = capital * used_leverage * (profit_pct / 100)
 
-                # ذخیره زمان سیگنال برای استفاده بعدی
                 current_signal_time = format_iran_time()
 
                 signal_message = (
@@ -1189,7 +1348,7 @@ def analyze_and_execute():
                         pass
                 time.sleep(0.5)
 
-                # ذخیره در تاریخچه (قبل از ثبت سفارش)
+                # ذخیره در تاریخچه
                 history = load_history()
                 history.append({
                     'symbol': symbol, 'direction': direction,
@@ -1197,9 +1356,14 @@ def analyze_and_execute():
                     'signal_time': current_signal_time, 'result': None,
                     'type': sig['type'], 'capital': capital,
                     'leverage': int(used_leverage), 'qty': qty,
-                    'signal_number': signal_number
+                    'signal_number': signal_number,
+                    'signal_id': sig_id
                 })
                 save_history(history)
+
+                # ثبت سیگنال به عنوان ارسال‌شده
+                sent_signals.add(sig_id)
+                save_sent_signals(sent_signals)
 
                 if exchange.connected:
                     try:
@@ -1207,7 +1371,6 @@ def analyze_and_execute():
                                                {'leverage': int(used_leverage), 'stopLoss': stop, 'takeProfit': target})
                         position_id = order_result.get('id', 'N/A')
 
-                        # به‌روزرسانی position_id در تاریخچه
                         history = load_history()
                         for t in history:
                             if t.get('signal_time') == current_signal_time:
@@ -1292,13 +1455,18 @@ if __name__ == "__main__":
         f"🔷 همه با گیت فیلتر SSL Hybrid (5m)\n"
         f"⚙️ Pivot: {LEFT_BARS}/{RIGHT_BARS} | تاریخچه: {HISTORY_BARS} کندل\n"
         f"🎯 تارگت: همیشه RR={TARGET_RR}\n"
-        f"📊 بهترین سیگنال در هر نوع (حداکثر ۳ سیگنال در هر جهت)\n"
+        f"📊 بهترین سیگنال در هر نوع + شناسه یکتا برای جلوگیری از تکرار\n"
         f"🔍 پیگیری با قیمت لحظه‌ای صرافی\n"
         f"📌 فقط دو پیوت آخر مقایسه میشن (مثل Pine)\n\n"
         f"📌 هشتگ‌های ثابت:\n{hashtag_list}\n\n"
         f"📊 شمارنده سیگنال: از #Signal_{SIGNAL_COUNTER + 1} شروع می‌شود\n\n"
         f"🕒 {format_iran_time()}"
     )
+    
+    # دریافت و گزارش ۱۰ معامله آخر صرافی
+    exchange = TrueTradePrivateExchange(API_KEY, API_SECRET, BASE_URL)
+    fetch_and_report_recent_trades(exchange)
+    
     run_startup_diagnostic()
     threading.Thread(target=lambda: app.run(host="0.0.0.0", port=10000), daemon=True).start()
-    main_loop() 
+    main_loop()
