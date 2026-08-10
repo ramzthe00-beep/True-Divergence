@@ -6,6 +6,7 @@ DTM v6 FC — Divergence + Golden/Death Cross Signal Bot
 + تمام امکانات DTM Hybrid (Pine-parity fixes, reporting, state persistence, etc.)
 + **NEW**: بهترین سیگنال در هر نوع (کلاسیک/مخفی/تقاطع) — حداکثر ۳ سیگنال برای هر جهت
 + **NEW**: پیگیری استاپ و تارگت با قیمت لحظه‌ای صرافی (مستقل از هیستوری)
++ **FIXED**: فقط دو پیوت آخر (پشت سر هم) برای واگرایی مقایسه میشن (مثل Pine)
 """
 
 import os
@@ -660,7 +661,7 @@ def process_ma_crosses(closed_df_indexed, ma_f, ma_m, ma_s, state, start_bar, en
     return events
 
 # =====================================================================================
-# تشخیص سیگنال — بهترین سیگنال در هر نوع
+# تشخیص سیگنال — بهترین سیگنال در هر نوع + فقط دو پیوت آخر
 # =====================================================================================
 def detect_signal(df_1m, df_5m, state, symbol, debug=False):
     debug_log = []
@@ -775,95 +776,109 @@ def detect_signal(df_1m, df_5m, state, symbol, debug=False):
                                    'stop': stop, 'target': target, 'extra': "⬇تقاطع مرگ", 'score': 0})
             log(f"   ⬇️ Death Cross @ {ets} (gate_short=True)")
 
-    # ── واگرایی نزولی/مخفی‌نزولی ────────────────────────────────────────
+    # ── واگرایی نزولی/مخفی‌نزولی (فقط دو پیوت آخر) ─────────────────────
     for new_ph in new_pivots_high:
         if len(state.pivot_highs) < 2:
             continue
         idx = next((i for i, p in enumerate(state.pivot_highs) if p['ts'] == new_ph['ts']), None)
-        if idx is None or idx == 0:
+        if idx is None or idx < 1:
             continue
-        for prev_idx in range(max(0, idx - 20), idx):
-            p1 = state.pivot_highs[prev_idx]
-            p2 = state.pivot_highs[idx]
-            bar1 = resolve_bar_from_ts(closed_df_indexed, p1['ts'])
-            bar2 = resolve_bar_from_ts(closed_df_indexed, p2['ts'])
-            if bar1 is None or bar2 is None:
-                continue
-            confirm_bar2 = min(bar2 + RIGHT_BARS, n - 1)
-            if not trending.iloc[confirm_bar2]:
-                continue
-            div_rsi = div_macd = hid = False
-            div_hist = False
-            if p2['price'] > p1['price']:
-                div_rsi = p2['rsi'] < p1['rsi']
-                div_macd = p2['macdline'] < p1['macdline']
-            elif p2['price'] < p1['price']:
-                hid = p2['rsi'] > p1['rsi'] or p2['macdline'] > p1['macdline']
+        
+        # FIXED: فقط پیوت قبلی (دقیقاً پشت سر هم، مثل Pine)
+        p1 = state.pivot_highs[idx - 1]
+        p2 = state.pivot_highs[idx]
+        
+        bar1 = resolve_bar_from_ts(closed_df_indexed, p1['ts'])
+        bar2 = resolve_bar_from_ts(closed_df_indexed, p2['ts'])
+        if bar1 is None or bar2 is None:
+            continue
+        
+        confirm_bar2 = min(bar2 + RIGHT_BARS, n - 1)
+        if not trending.iloc[confirm_bar2]:
+            continue
 
-            if (div_rsi or div_macd or div_hist) and gate_short:
-                fib_ok = check_fib_near(high, low, confirm_bar2, p2['price'], is_high_side=True)
-                pa_ok = check_shooting_star(closed_df, bar2)
-                score = sum([div_rsi, div_hist, div_macd, fib_ok, pa_ok])
-                if score >= MIN_CLASSIC_SCORE:
-                    stop, target = compute_divergence_sl_tp(p1['price'], p2['price'], "short", entry_price, atr14.iloc[-1])
-                    if stop and target:
-                        sig = {'type': 'CLASSIC_BEARISH_DIV', 'direction': 'SELL', 'entry': entry_price,
-                                'stop': stop, 'target': target,
-                                'extra': f"{score_stars(score)}\nواگرایی↓[{score}/5]", 'score': score}
-                        if best_classic_bear is None or score > best_classic_bear['score']:
-                            best_classic_bear = sig
-            if hid and gate_short:
+        div_rsi = div_macd = hid = False
+        div_hist = False
+
+        if p2['price'] > p1['price']:
+            div_rsi = p2['rsi'] < p1['rsi']
+            div_macd = p2['macdline'] < p1['macdline']
+        elif p2['price'] < p1['price']:
+            hid = p2['rsi'] > p1['rsi'] or p2['macdline'] > p1['macdline']
+
+        if (div_rsi or div_macd or div_hist) and gate_short:
+            fib_ok = check_fib_near(high, low, confirm_bar2, p2['price'], is_high_side=True)
+            pa_ok = check_shooting_star(closed_df, bar2)
+            score = sum([div_rsi, div_hist, div_macd, fib_ok, pa_ok])
+            if score >= MIN_CLASSIC_SCORE:
                 stop, target = compute_divergence_sl_tp(p1['price'], p2['price'], "short", entry_price, atr14.iloc[-1])
                 if stop and target:
-                    sig = {'type': 'HIDDEN_BEARISH_DIV', 'direction': 'SELL', 'entry': entry_price,
-                            'stop': stop, 'target': target, 'extra': "~واگرایی مخفی↓", 'score': 0}
-                    if best_hidden_bear is None:
-                        best_hidden_bear = sig
+                    sig = {'type': 'CLASSIC_BEARISH_DIV', 'direction': 'SELL', 'entry': entry_price,
+                            'stop': stop, 'target': target,
+                            'extra': f"{score_stars(score)}\nواگرایی↓[{score}/5]", 'score': score}
+                    if best_classic_bear is None or score > best_classic_bear['score']:
+                        best_classic_bear = sig
+                        log(f"   🔴 Classic Bearish Div score={score}/5 (gate_short=True)")
+        if hid and gate_short:
+            stop, target = compute_divergence_sl_tp(p1['price'], p2['price'], "short", entry_price, atr14.iloc[-1])
+            if stop and target:
+                sig = {'type': 'HIDDEN_BEARISH_DIV', 'direction': 'SELL', 'entry': entry_price,
+                        'stop': stop, 'target': target, 'extra': "~واگرایی مخفی↓", 'score': 0}
+                if best_hidden_bear is None:
+                    best_hidden_bear = sig
+                    log(f"   🟠 Hidden Bearish Div (gate_short=True)")
 
-    # ── واگرایی صعودی/مخفی‌صعودی ────────────────────────────────────────
+    # ── واگرایی صعودی/مخفی‌صعودی (فقط دو پیوت آخر) ─────────────────────
     for new_pl in new_pivots_low:
         if len(state.pivot_lows) < 2:
             continue
         idx = next((i for i, p in enumerate(state.pivot_lows) if p['ts'] == new_pl['ts']), None)
-        if idx is None or idx == 0:
+        if idx is None or idx < 1:
             continue
-        for prev_idx in range(max(0, idx - 20), idx):
-            p1 = state.pivot_lows[prev_idx]
-            p2 = state.pivot_lows[idx]
-            bar1 = resolve_bar_from_ts(closed_df_indexed, p1['ts'])
-            bar2 = resolve_bar_from_ts(closed_df_indexed, p2['ts'])
-            if bar1 is None or bar2 is None:
-                continue
-            confirm_bar2 = min(bar2 + RIGHT_BARS, n - 1)
-            if not trending.iloc[confirm_bar2]:
-                continue
-            div_rsi = div_macd = hid = False
-            div_hist = False
-            if p2['price'] < p1['price']:
-                div_rsi = p2['rsi'] > p1['rsi']
-                div_macd = p2['macdline'] > p1['macdline']
-            elif p2['price'] > p1['price']:
-                hid = p2['rsi'] < p1['rsi'] or p2['macdline'] < p1['macdline']
+        
+        # FIXED: فقط پیوت قبلی (دقیقاً پشت سر هم، مثل Pine)
+        p1 = state.pivot_lows[idx - 1]
+        p2 = state.pivot_lows[idx]
+        
+        bar1 = resolve_bar_from_ts(closed_df_indexed, p1['ts'])
+        bar2 = resolve_bar_from_ts(closed_df_indexed, p2['ts'])
+        if bar1 is None or bar2 is None:
+            continue
+        
+        confirm_bar2 = min(bar2 + RIGHT_BARS, n - 1)
+        if not trending.iloc[confirm_bar2]:
+            continue
 
-            if (div_rsi or div_macd or div_hist) and gate_long:
-                fib_ok = check_fib_near(high, low, confirm_bar2, p2['price'], is_high_side=False)
-                pa_ok = check_hammer(closed_df, bar2)
-                score = sum([div_rsi, div_hist, div_macd, fib_ok, pa_ok])
-                if score >= MIN_CLASSIC_SCORE:
-                    stop, target = compute_divergence_sl_tp(p1['price'], p2['price'], "long", entry_price, atr14.iloc[-1])
-                    if stop and target:
-                        sig = {'type': 'CLASSIC_BULLISH_DIV', 'direction': 'BUY', 'entry': entry_price,
-                                'stop': stop, 'target': target,
-                                'extra': f"{score_stars(score)}\nواگرایی↑[{score}/5]", 'score': score}
-                        if best_classic_bull is None or score > best_classic_bull['score']:
-                            best_classic_bull = sig
-            if hid and gate_long:
+        div_rsi = div_macd = hid = False
+        div_hist = False
+
+        if p2['price'] < p1['price']:
+            div_rsi = p2['rsi'] > p1['rsi']
+            div_macd = p2['macdline'] > p1['macdline']
+        elif p2['price'] > p1['price']:
+            hid = p2['rsi'] < p1['rsi'] or p2['macdline'] < p1['macdline']
+
+        if (div_rsi or div_macd or div_hist) and gate_long:
+            fib_ok = check_fib_near(high, low, confirm_bar2, p2['price'], is_high_side=False)
+            pa_ok = check_hammer(closed_df, bar2)
+            score = sum([div_rsi, div_hist, div_macd, fib_ok, pa_ok])
+            if score >= MIN_CLASSIC_SCORE:
                 stop, target = compute_divergence_sl_tp(p1['price'], p2['price'], "long", entry_price, atr14.iloc[-1])
                 if stop and target:
-                    sig = {'type': 'HIDDEN_BULLISH_DIV', 'direction': 'BUY', 'entry': entry_price,
-                            'stop': stop, 'target': target, 'extra': "~واگرایی مخفی↑", 'score': 0}
-                    if best_hidden_bull is None:
-                        best_hidden_bull = sig
+                    sig = {'type': 'CLASSIC_BULLISH_DIV', 'direction': 'BUY', 'entry': entry_price,
+                            'stop': stop, 'target': target,
+                            'extra': f"{score_stars(score)}\nواگرایی↑[{score}/5]", 'score': score}
+                    if best_classic_bull is None or score > best_classic_bull['score']:
+                        best_classic_bull = sig
+                        log(f"   🟢 Classic Bullish Div score={score}/5 (gate_long=True)")
+        if hid and gate_long:
+            stop, target = compute_divergence_sl_tp(p1['price'], p2['price'], "long", entry_price, atr14.iloc[-1])
+            if stop and target:
+                sig = {'type': 'HIDDEN_BULLISH_DIV', 'direction': 'BUY', 'entry': entry_price,
+                        'stop': stop, 'target': target, 'extra': "~واگرایی مخفی↑", 'score': 0}
+                if best_hidden_bull is None:
+                    best_hidden_bull = sig
+                    log(f"   🔵 Hidden Bullish Div (gate_long=True)")
 
     # ── جمع‌آوری نهایی سیگنال‌ها ─────────────────────────────────────────
     signals = []
@@ -1142,6 +1157,9 @@ def analyze_and_execute():
                 qty = (capital * used_leverage) / entry
                 potential_profit = capital * used_leverage * (profit_pct / 100)
 
+                # ذخیره زمان سیگنال برای استفاده بعدی
+                current_signal_time = format_iran_time()
+
                 signal_message = (
                     f"{dir_emoji} Signal {sig['type']} — {symbol} {HASHTAGS['signal']} #Signal_{signal_number}\n"
                     f"━━━━━━━━━━━━━━━━━━━━━━\n\n"
@@ -1153,7 +1171,7 @@ def analyze_and_execute():
                     f"📈 Potential Profit: +{profit_pct:.2f}%\n"
                     f"📉 Potential Loss: -{loss_pct:.2f}%\n"
                     f"⚖️ Risk/Reward Ratio: {rr:.2f}\n\n"
-                    f"━━━━━━━━━━━━━━━━━━━━━━\n🕒 {format_iran_time()}"
+                    f"━━━━━━━━━━━━━━━━━━━━━━\n🕒 {current_signal_time}"
                 )
                 try:
                     send_telegram_message(signal_message)
@@ -1163,7 +1181,7 @@ def analyze_and_execute():
                         f"{dir_emoji} Signal {sig['type']} — {symbol} {HASHTAGS['signal']} #Signal_{signal_number}\n"
                         f"📍 Entry: {entry:.{PRICE_PRECISION.get(symbol, 2)}f}\n"
                         f"🛑 SL: {stop:.{PRICE_PRECISION.get(symbol, 2)}f} | 🎯 TP: {target:.{PRICE_PRECISION.get(symbol, 2)}f}\n"
-                        f"🕒 {format_iran_time()}"
+                        f"🕒 {current_signal_time}"
                     )
                     try:
                         send_telegram_message(fallback_msg)
@@ -1176,7 +1194,7 @@ def analyze_and_execute():
                 history.append({
                     'symbol': symbol, 'direction': direction,
                     'entry_price': entry, 'stop_loss': stop, 'take_profit': target,
-                    'signal_time': format_iran_time(), 'result': None,
+                    'signal_time': current_signal_time, 'result': None,
                     'type': sig['type'], 'capital': capital,
                     'leverage': int(used_leverage), 'qty': qty,
                     'signal_number': signal_number
@@ -1189,9 +1207,10 @@ def analyze_and_execute():
                                                {'leverage': int(used_leverage), 'stopLoss': stop, 'takeProfit': target})
                         position_id = order_result.get('id', 'N/A')
 
+                        # به‌روزرسانی position_id در تاریخچه
                         history = load_history()
                         for t in history:
-                            if t.get('signal_time') == trade_record['signal_time']:
+                            if t.get('signal_time') == current_signal_time:
                                 t['position_id'] = position_id
                                 break
                         save_history(history)
@@ -1274,7 +1293,8 @@ if __name__ == "__main__":
         f"⚙️ Pivot: {LEFT_BARS}/{RIGHT_BARS} | تاریخچه: {HISTORY_BARS} کندل\n"
         f"🎯 تارگت: همیشه RR={TARGET_RR}\n"
         f"📊 بهترین سیگنال در هر نوع (حداکثر ۳ سیگنال در هر جهت)\n"
-        f"🔍 پیگیری با قیمت لحظه‌ای صرافی\n\n"
+        f"🔍 پیگیری با قیمت لحظه‌ای صرافی\n"
+        f"📌 فقط دو پیوت آخر مقایسه میشن (مثل Pine)\n\n"
         f"📌 هشتگ‌های ثابت:\n{hashtag_list}\n\n"
         f"📊 شمارنده سیگنال: از #Signal_{SIGNAL_COUNTER + 1} شروع می‌شود\n\n"
         f"🕒 {format_iran_time()}"
