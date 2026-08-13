@@ -234,6 +234,7 @@ def run_pyne_indicator(
     if df is None or df.empty:
         return None
 
+    # ✅ تبدیل به Path
     script_path = Path(script_path)
     if not script_path.exists():
         logger.error(f"[PYNE_BRIDGE] فایل اسکریپت پیدا نشد: {script_path}")
@@ -247,7 +248,8 @@ def run_pyne_indicator(
     attempts = ([{"security_data": security_data}] if security_data else []) + [{}]
     for kwargs in attempts:
         try:
-            runner = ScriptRunner(str(script_path), _dataframe_to_ohlcv_iter(df), syminfo_obj, **kwargs)
+            # ✅ اصلاح: ارسال مستقیم script_path (بدون str())
+            runner = ScriptRunner(script_path, _dataframe_to_ohlcv_iter(df), syminfo_obj, **kwargs)
             break
         except TypeError as e:
             last_err = e
