@@ -166,43 +166,61 @@ def _build_security_data(
         return None
 
 
+# =====================================================================================
+# 🔧 اصلاح شده: تابع _build_syminfo با SymInfo واقعی
+# =====================================================================================
 def _build_syminfo(symbol: str) -> Any:
     """
     ساخت شیء SymInfo برای ScriptRunner.
-    اگر SymInfo در دسترس نباشد، از dict ساده استفاده می‌کند.
+    مطابق مستندات رسمی PyneCore و pynecore-examples.
     """
     tick = 0.01
     su = symbol.upper()
+    base = su.replace("USDT", "")
+    
     if su == "DOGEUSDT":
         tick = 0.00001
-
-    # تلاش برای ساخت SymInfo واقعی
+    elif su == "LTCUSDT":
+        tick = 0.01
+    elif su == "ETHUSDT":
+        tick = 0.01
+    
+    # ============================================================
+    # تلاش برای ساخت SymInfo واقعی (مطابق مستندات PyneCore)
+    # ============================================================
     if SymInfo is not None:
         try:
             return SymInfo(
-                symtype="crypto",
                 prefix="BINANCE",
+                description=f"{base} / USDT",
                 ticker=su,
                 currency="USDT",
-                basecurrency=su.replace("USDT", ""),
+                basecurrency=base,
+                type="crypto",
                 mintick=tick,
+                pricescale=100,
+                minmove=1,
                 pointvalue=1.0,
                 timezone="UTC",
+                volumetype="quote",
             )
         except TypeError as e:
             logger.warning(
-                f"[PYNE_BRIDGE] امضای سازنده‌ی SymInfo نسخه‌ی نصب‌شده با آنچه اینجا "
-                f"فرض شده مطابقت ندارد ({e}). فیلدهای واقعی را با دستور زیر بررسی کنید:\n"
-                f'    python -c "from pynecore.types.syminfo import SymInfo; help(SymInfo)"'
+                f"[PYNE_BRIDGE] امضای سازنده‌ی SymInfo با آنچه فرض شده مطابقت ندارد ({e}). "
+                f"از dict fallback استفاده می‌شود."
             )
-
-    # Fallback: برگرداندن dict ساده
+    
+    # ============================================================
+    # Fallback: برگرداندن dict ساده (برای نسخه‌های قدیمی PyneCore)
+    # ============================================================
     return {
-        "symtype": "crypto",
         "prefix": "BINANCE",
         "ticker": su,
         "currency": "USDT",
+        "basecurrency": base,
+        "type": "crypto",
         "mintick": tick,
+        "pointvalue": 1.0,
         "timezone": "UTC",
     }
 
