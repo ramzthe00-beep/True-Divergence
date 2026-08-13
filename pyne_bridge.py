@@ -183,15 +183,14 @@ def _build_security_data(
 
 
 # =====================================================================================
-# 🔧 ✅ اصلاح قطعی: ساخت SymInfo مطابق مستندات رسمی PyneCore
+# 🔧 ✅ اصلاح قطعی: ساخت SymInfo با پارامتر period (مطابق نسخه نصب‌شده PyneCore)
 # =====================================================================================
 def _build_syminfo(symbol: str) -> Any:
     """
     ساخت شیء SymInfo برای ScriptRunner.
-    مطابق مستندات رسمی PyneCore و نمونه‌های گیت‌هاب.
+    مطابق نسخه نصب‌شده PyneCore - با پارامتر period اجباری.
     """
     if SymInfo is None:
-        # اگر SymInfo در دسترس نیست، fallback به dict
         su = symbol.upper()
         base = su.replace("USDT", "")
         tick = 0.00001 if su == "DOGEUSDT" else 0.01
@@ -201,17 +200,16 @@ def _build_syminfo(symbol: str) -> Any:
             "currency": "USDT",
             "basecurrency": base,
             "type": "crypto",
+            "period": "1m",
             "mintick": tick,
             "pointvalue": 1.0,
             "timezone": "UTC",
         }
     
     try:
-        # ساخت SymInfo با پارامترهای کامل (مطابق مثال‌های رسمی)
         su = symbol.upper()
         base = su.replace("USDT", "")
         
-        # تعیین tick size بر اساس نماد
         if su == "DOGEUSDT":
             tick = 0.00001
         elif su == "LTCUSDT":
@@ -221,6 +219,7 @@ def _build_syminfo(symbol: str) -> Any:
         else:
             tick = 0.01
         
+        # ✅ اضافه کردن پارامتر period (طبق خطای دریافتی از سرور)
         return SymInfo(
             prefix="BINANCE",
             description=f"{base} / USDT",
@@ -228,6 +227,7 @@ def _build_syminfo(symbol: str) -> Any:
             currency="USDT",
             basecurrency=base,
             type="crypto",
+            period="1m",  # <--- پارامتر اجباری
             mintick=tick,
             pricescale=100,
             minmove=1,
@@ -241,7 +241,6 @@ def _build_syminfo(symbol: str) -> Any:
         )
     except Exception as e:
         logger.warning(f"[PYNE_BRIDGE] ساخت SymInfo با خطا مواجه شد: {e}")
-        # Fallback: برگرداندن dict ساده
         su = symbol.upper()
         base = su.replace("USDT", "")
         tick = 0.00001 if su == "DOGEUSDT" else 0.01
@@ -251,6 +250,7 @@ def _build_syminfo(symbol: str) -> Any:
             "currency": "USDT",
             "basecurrency": base,
             "type": "crypto",
+            "period": "1m",
             "mintick": tick,
             "pointvalue": 1.0,
             "timezone": "UTC",
