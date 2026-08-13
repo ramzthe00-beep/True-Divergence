@@ -1,11 +1,6 @@
 # -*- coding: utf-8 -*-
 """
 pyne_bridge.py — پل ادغام PyneCore با بات معاملاتی (DataFrame Bridge)
-======================================================================
-این ماژول اسکریپت کامپایل‌شده‌ی PyneCore شما (dtm_pyne_strategy.py) را
-از طریق ScriptRunner رسمی روی یک pandas.DataFrame (OHLCV با ایندکس
-datetime) اجرا می‌کند و خروجی plot/plotshape آن را به‌صورت dict از
-pd.Series برمی‌گرداند.
 """
 
 from __future__ import annotations
@@ -20,7 +15,7 @@ import pandas as pd
 logger = logging.getLogger(__name__)
 
 # =====================================================================================
-# Import PyneCore با مسیرهای صحیح (طبق مستندات رسمی)
+# Import PyneCore
 # =====================================================================================
 PYNECORE_AVAILABLE = True
 _import_error: Optional[BaseException] = None
@@ -30,9 +25,6 @@ OHLCV: Any = None
 SymInfo: Any = None
 pyne_na: Any = None
 
-# ============================================================
-# ✅ مسیرهای صحیح Import - مطابق مستندات رسمی PyneCore
-# ============================================================
 try:
     from pynecore.core.script_runner import ScriptRunner as _ScriptRunner
     ScriptRunner = _ScriptRunner
@@ -77,14 +69,10 @@ except ImportError:
     pyne_na = None
 
 if not PYNECORE_AVAILABLE:
-    logger.error(
-        f"[PYNE_BRIDGE] PyneCore در دسترس نیست ({_import_error}). "
-        f"سیگنال‌گیری از PyneCore غیرفعال می‌شود و بات به‌صورت خودکار "
-        f"به منطق تشخیص داخلی خودش fallback می‌کند."
-    )
+    logger.error(f"[PYNE_BRIDGE] PyneCore در دسترس نیست ({_import_error}).")
 
 # =====================================================================================
-# نگاشت نام سیگنال pine (نام plotshape در اسکریپت کامپایل‌شده) → جهت معامله
+# نگاشت سیگنال
 # =====================================================================================
 SIGNAL_PLOT_MAP: Dict[str, Dict[str, str]] = {
     "CD-": {"side": "SELL", "label": "Classic Bearish"},
@@ -93,12 +81,10 @@ SIGNAL_PLOT_MAP: Dict[str, Dict[str, str]] = {
     "HD-": {"side": "SELL", "label": "Hidden Bearish"},
 }
 
-
 # =====================================================================================
-# مدیریت NA
+# توابع کمکی
 # =====================================================================================
 def _pyne_value_is_na(value: Any) -> bool:
-    """بررسی صحیح NA بودن یک مقدار خروجی از PyneCore."""
     if value is None:
         return True
     if pyne_na is not None:
@@ -112,9 +98,7 @@ def _pyne_value_is_na(value: Any) -> bool:
     except (TypeError, ValueError):
         return False
 
-
 def _pyne_to_float(value: Any) -> float:
-    """تبدیل امن یک مقدار عددی PyneCore به float پایتون؛ na → np.nan."""
     if _pyne_value_is_na(value):
         return float("nan")
     try:
@@ -122,9 +106,7 @@ def _pyne_to_float(value: Any) -> float:
     except (TypeError, ValueError):
         return float("nan")
 
-
 def _pyne_to_bool(value: Any) -> bool:
-    """تبدیل امن یک مقدار bool خروجی PyneCore به bool."""
     if _pyne_value_is_na(value):
         return False
     if isinstance(value, bool):
@@ -134,21 +116,15 @@ def _pyne_to_bool(value: Any) -> bool:
     except Exception:
         return False
 
-
 # =====================================================================================
-# DataFrame Bridge: تبدیل pandas.DataFrame → ایتریتور OHLCV
+# DataFrame Bridge
 # =====================================================================================
 def _dataframe_to_ohlcv_iter(df: pd.DataFrame) -> Iterator[Any]:
-    """
-    هر ردیف از DataFrame را به یک آبجکت OHLCV تبدیل می‌کند.
-    """
     if OHLCV is None:
         raise RuntimeError("pynecore.types.ohlcv.OHLCV در دسترس نیست.")
-
     idx = df.index
     if getattr(idx, "tz", None) is None:
         idx = idx.tz_localize("UTC")
-
     cols = {c.lower(): c for c in df.columns}
     for ts, row in zip(idx, df.itertuples(index=False)):
         row_dict = row._asdict()
@@ -161,101 +137,76 @@ def _dataframe_to_ohlcv_iter(df: pd.DataFrame) -> Iterator[Any]:
             volume=float(row_dict.get(cols.get("volume", "volume"), 0.0) or 0.0),
         )
 
-
-def _build_security_data(
-    df: pd.DataFrame, mtf_timeframe: str = "240"
-) -> Optional[Dict[str, List[Any]]]:
-    """ساخت داده‌های MTF برای request.security."""
+def _build_security_data(df: pd.DataFrame, mtf_timeframe: str = "240") -> Optional[Dict[str, List[Any]]]:
     try:
         resample_map = {"240": "4h", "60": "1h", "30": "30min", "15": "15min", "D": "1D", "W": "1W"}
         rule = resample_map.get(mtf_timeframe, "4h")
-        htf = (
-            df.resample(rule)
-            .agg({"open": "first", "high": "max", "low": "min", "close": "last", "volume": "sum"})
-            .dropna()
-        )
+        htf = df.resample(rule).agg({"open": "first", "high": "max", "low": "min", "close": "last", "volume": "sum"}).dropna()
         if htf.empty:
             return None
         return {mtf_timeframe: list(_dataframe_to_ohlcv_iter(htf))}
     except Exception as e:
-        logger.warning(f"[PYNE_BRIDGE] ساخت داده‌ی MTF ناموفق بود، بدون آن ادامه می‌دهیم: {e}")
+        logger.warning(f"[PYNE_BRIDGE] ساخت MTF ناموفق: {e}")
         return None
 
-
 # =====================================================================================
-# 🔧 ✅ اصلاح قطعی: ساخت SymInfo با پارامتر period (مطابق نسخه نصب‌شده PyneCore)
+# ✅ ساخت SymInfo - با try/except کامل برای هر نسخه PyneCore
 # =====================================================================================
 def _build_syminfo(symbol: str) -> Any:
     """
-    ساخت شیء SymInfo برای ScriptRunner.
-    مطابق نسخه نصب‌شده PyneCore - با پارامتر period اجباری.
+    ساخت SymInfo - تلاش با پارامترهای مختلف برای سازگاری با نسخه‌های مختلف PyneCore
     """
+    su = symbol.upper()
+    base = su.replace("USDT", "")
+    tick = 0.00001 if su == "DOGEUSDT" else 0.01
+
+    # اگر SymInfo در دسترس نیست -> dict fallback
     if SymInfo is None:
-        su = symbol.upper()
-        base = su.replace("USDT", "")
-        tick = 0.00001 if su == "DOGEUSDT" else 0.01
         return {
-            "prefix": "BINANCE",
-            "ticker": su,
-            "currency": "USDT",
-            "basecurrency": base,
-            "type": "crypto",
-            "period": "1m",
-            "mintick": tick,
-            "pointvalue": 1.0,
-            "timezone": "UTC",
-        }
-    
-    try:
-        su = symbol.upper()
-        base = su.replace("USDT", "")
-        
-        if su == "DOGEUSDT":
-            tick = 0.00001
-        elif su == "LTCUSDT":
-            tick = 0.01
-        elif su == "ETHUSDT":
-            tick = 0.01
-        else:
-            tick = 0.01
-        
-        # ✅ اضافه کردن پارامتر period (طبق خطای دریافتی از سرور)
-        return SymInfo(
-            prefix="BINANCE",
-            description=f"{base} / USDT",
-            ticker=su,
-            currency="USDT",
-            basecurrency=base,
-            type="crypto",
-            period="1m",  # <--- پارامتر اجباری
-            mintick=tick,
-            pricescale=100,
-            minmove=1,
-            pointvalue=1.0,
-            mincontract=0.00001 if base == "BTC" else 0.0001,
-            timezone="UTC",
-            volumetype="quote",
-            opening_hours=[],
-            session_starts=[],
-            session_ends=[],
-        )
-    except Exception as e:
-        logger.warning(f"[PYNE_BRIDGE] ساخت SymInfo با خطا مواجه شد: {e}")
-        su = symbol.upper()
-        base = su.replace("USDT", "")
-        tick = 0.00001 if su == "DOGEUSDT" else 0.01
-        return {
-            "prefix": "BINANCE",
-            "ticker": su,
-            "currency": "USDT",
-            "basecurrency": base,
-            "type": "crypto",
-            "period": "1m",
-            "mintick": tick,
-            "pointvalue": 1.0,
-            "timezone": "UTC",
+            "prefix": "BINANCE", "ticker": su, "currency": "USDT",
+            "basecurrency": base, "type": "crypto", "mintick": tick,
+            "pointvalue": 1.0, "timezone": "UTC",
         }
 
+    # تلاش با پارامترهای مختلف
+    for params in [
+        # تلاش 1: با period (نسخه‌های جدید)
+        {
+            "prefix": "BINANCE", "description": f"{base} / USDT",
+            "ticker": su, "currency": "USDT", "basecurrency": base,
+            "type": "crypto", "period": "1m", "mintick": tick,
+            "pricescale": 100, "minmove": 1, "pointvalue": 1.0,
+            "mincontract": 0.0001, "timezone": "UTC", "volumetype": "quote",
+        },
+        # تلاش 2: بدون period (نسخه‌های قدیمی)
+        {
+            "prefix": "BINANCE", "description": f"{base} / USDT",
+            "ticker": su, "currency": "USDT", "basecurrency": base,
+            "type": "crypto", "mintick": tick,
+            "pricescale": 100, "minmove": 1, "pointvalue": 1.0,
+            "timezone": "UTC",
+        },
+        # تلاش 3: فقط پارامترهای ضروری
+        {
+            "prefix": "BINANCE", "ticker": su,
+            "currency": "USDT", "basecurrency": base,
+            "type": "crypto", "mintick": tick,
+        },
+    ]:
+        try:
+            return SymInfo(**params)
+        except TypeError as e:
+            continue
+        except Exception as e:
+            continue
+
+    # اگر هیچکدام کار نکرد -> dict fallback
+    logger.warning(f"[PYNE_BRIDGE] هیچکدام از پارامترهای SymInfo کار نکرد، از dict استفاده می‌شود")
+    return {
+        "prefix": "BINANCE", "ticker": su, "currency": "USDT",
+        "basecurrency": base, "type": "crypto", "mintick": tick,
+        "pointvalue": 1.0, "timezone": "UTC",
+    }
 
 # =====================================================================================
 # تابع اصلی
@@ -266,14 +217,12 @@ def run_pyne_indicator(
     symbol: str,
     mtf_timeframe: str = "240",
 ) -> Optional[Dict[str, pd.Series]]:
-    """
-    اجرای اسکریپت کامپایل‌شده‌ی PyneCore روی یک DataFrame.
-    """
     if not PYNECORE_AVAILABLE or ScriptRunner is None:
         return None
     if df is None or df.empty:
         return None
 
+    # ✅ تبدیل به Path (رفع خطای 'str' object has no attribute 'parent')
     script_path = Path(script_path)
     if not script_path.exists():
         logger.error(f"[PYNE_BRIDGE] فایل اسکریپت پیدا نشد: {script_path}")
@@ -293,11 +242,11 @@ def run_pyne_indicator(
             last_err = e
             continue
         except Exception as e:
-            logger.error(f"[PYNE_BRIDGE] ساخت ScriptRunner ناموفق بود: {e}")
+            logger.error(f"[PYNE_BRIDGE] ساخت ScriptRunner ناموفق: {e}")
             return None
 
     if runner is None:
-        logger.error(f"[PYNE_BRIDGE] ساخت ScriptRunner ناموفق بود: {last_err}")
+        logger.error(f"[PYNE_BRIDGE] ساخت ScriptRunner ناموفق: {last_err}")
         return None
 
     plot_columns: Dict[str, List[Any]] = {}
@@ -314,11 +263,11 @@ def run_pyne_indicator(
                 if len(plot_columns[key]) < n_bars:
                     plot_columns[key].append(float("nan"))
     except Exception as e:
-        logger.error(f"[PYNE_BRIDGE] اجرای ScriptRunner با خطا متوقف شد: {e}")
+        logger.error(f"[PYNE_BRIDGE] اجرای ScriptRunner متوقف شد: {e}")
         return None
 
     if n_bars == 0 or not plot_columns:
-        logger.warning("[PYNE_BRIDGE] اسکریپت اجرا شد ولی هیچ plot/plotshape ای برنگرداند.")
+        logger.warning("[PYNE_BRIDGE] هیچ plot/plotshape ای برنگرداند.")
         return None
 
     aligned_index = df.index[-n_bars:]
@@ -333,19 +282,12 @@ def run_pyne_indicator(
 
     return out
 
-
 # =====================================================================================
-# استخراج «فقط سیگنال نهایی»
+# استخراج سیگنال
 # =====================================================================================
-def extract_final_signal(
-    plots: Optional[Dict[str, pd.Series]],
-) -> Optional[Dict[str, Optional[str]]]:
-    """
-    از خروجی run_pyne_indicator، سیگنال نهایی روی آخرین کندل بسته‌شده را استخراج می‌کند.
-    """
+def extract_final_signal(plots: Optional[Dict[str, pd.Series]]) -> Optional[Dict[str, Optional[str]]]:
     if not plots:
         return None
-
     for plot_name, meta in SIGNAL_PLOT_MAP.items():
         series = plots.get(plot_name)
         if series is None or len(series) == 0:
@@ -353,32 +295,24 @@ def extract_final_signal(
         last_val = series.iloc[-1]
         if _pyne_to_bool(last_val):
             return {"signal": meta["side"], "label": meta["label"]}
-
     return {"signal": None, "label": None}
 
-
 # =====================================================================================
-# تست مستقل سریع
+# تست
 # =====================================================================================
 if __name__ == "__main__":
     import sys
-
     logging.basicConfig(level=logging.INFO)
-
     if len(sys.argv) < 3:
         print("Usage: python pyne_bridge.py <script_path.py> <ohlcv_csv_path> [symbol]")
         sys.exit(1)
-
     _script = sys.argv[1]
     _csv = sys.argv[2]
     _symbol = sys.argv[3] if len(sys.argv) > 3 else "LTCUSDT"
-
     _df = pd.read_csv(_csv, parse_dates=["timestamp"], index_col="timestamp")
     _plots = run_pyne_indicator(_df, _script, _symbol)
     if _plots is None:
-        print("❌ run_pyne_indicator چیزی برنگرداند — لاگ‌های بالا را ببینید.")
+        print("❌ run_pyne_indicator چیزی برنگرداند")
     else:
-        print(f"✅ ستون‌های plot دریافت‌شده: {list(_plots.keys())}")
-        for name, s in _plots.items():
-            print(f"  {name}: آخرین مقدار = {s.iloc[-1]}")
+        print(f"✅ ستون‌ها: {list(_plots.keys())}")
         print(f"سیگنال نهایی: {extract_final_signal(_plots)}")
