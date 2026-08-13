@@ -2,4 +2,4 @@ requests
 numpy
 pandas
 flask
-pynesys-pynecore
+pynesys-pynecore[cli]
