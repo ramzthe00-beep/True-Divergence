@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-pyne_bridge.py — پل ادغام PyneCore با بات معاملاتی (DataFrame Bridge)
+pyne_bridge.py — پل ادغام PyneCore با بات معاملاتی
 """
 
 from __future__ import annotations
@@ -28,39 +28,36 @@ pyne_na: Any = None
 try:
     from pynecore.core.script_runner import ScriptRunner as _ScriptRunner
     ScriptRunner = _ScriptRunner
-except ImportError as e1:
+except ImportError:
     try:
         from pynecore import ScriptRunner as _ScriptRunner
         ScriptRunner = _ScriptRunner
-    except ImportError as e2:
+    except ImportError:
         PYNECORE_AVAILABLE = False
-        _import_error = e2
 
 try:
     from pynecore.core.syminfo import SymInfo as _SymInfo
     SymInfo = _SymInfo
-except ImportError as e1:
+except ImportError:
     try:
         from pynecore import SymInfo as _SymInfo
         SymInfo = _SymInfo
-    except ImportError as e2:
+    except ImportError:
         try:
             from pynecore.types.syminfo import SymInfo as _SymInfo
             SymInfo = _SymInfo
-        except ImportError as e3:
+        except ImportError:
             PYNECORE_AVAILABLE = False
-            _import_error = _import_error or e3
 
 try:
     from pynecore.types.ohlcv import OHLCV as _OHLCV
     OHLCV = _OHLCV
-except ImportError as e:
+except ImportError:
     try:
         from pynecore import OHLCV as _OHLCV
         OHLCV = _OHLCV
     except ImportError:
         PYNECORE_AVAILABLE = False
-        _import_error = _import_error or e
 
 try:
     from pynecore.lib import na as _pyne_na
@@ -150,63 +147,78 @@ def _build_security_data(df: pd.DataFrame, mtf_timeframe: str = "240") -> Option
         return None
 
 # =====================================================================================
-# ✅ ساخت SymInfo - با try/except کامل برای هر نسخه PyneCore
+# ✅ ساخت SymInfo با پارامترهای دقیق (بر اساس inspect.signature)
 # =====================================================================================
 def _build_syminfo(symbol: str) -> Any:
     """
-    ساخت SymInfo - تلاش با پارامترهای مختلف برای سازگاری با نسخه‌های مختلف PyneCore
+    ساخت شیء SymInfo برای ScriptRunner.
+    مطابق با نسخه نصب‌شده PyneCore.
     """
     su = symbol.upper()
     base = su.replace("USDT", "")
-    tick = 0.00001 if su == "DOGEUSDT" else 0.01
-
+    
+    # تعیین tick size بر اساس نماد
+    if su == "DOGEUSDT":
+        tick = 0.00001
+    elif su == "LTCUSDT":
+        tick = 0.01
+    elif su == "ETHUSDT":
+        tick = 0.01
+    else:
+        tick = 0.01
+    
+    # حداقل قرارداد
+    min_contract = 0.0001
+    
     # اگر SymInfo در دسترس نیست -> dict fallback
     if SymInfo is None:
         return {
-            "prefix": "BINANCE", "ticker": su, "currency": "USDT",
-            "basecurrency": base, "type": "crypto", "mintick": tick,
-            "pointvalue": 1.0, "timezone": "UTC",
+            "prefix": "BINANCE",
+            "ticker": su,
+            "currency": "USDT",
+            "basecurrency": base,
+            "period": "1m",
+            "type": "crypto",
+            "mintick": tick,
+            "pointvalue": 1.0,
         }
-
-    # تلاش با پارامترهای مختلف
-    for params in [
-        # تلاش 1: با period (نسخه‌های جدید)
-        {
-            "prefix": "BINANCE", "description": f"{base} / USDT",
-            "ticker": su, "currency": "USDT", "basecurrency": base,
-            "type": "crypto", "period": "1m", "mintick": tick,
-            "pricescale": 100, "minmove": 1, "pointvalue": 1.0,
-            "mincontract": 0.0001, "timezone": "UTC", "volumetype": "quote",
-        },
-        # تلاش 2: بدون period (نسخه‌های قدیمی)
-        {
-            "prefix": "BINANCE", "description": f"{base} / USDT",
-            "ticker": su, "currency": "USDT", "basecurrency": base,
-            "type": "crypto", "mintick": tick,
-            "pricescale": 100, "minmove": 1, "pointvalue": 1.0,
-            "timezone": "UTC",
-        },
-        # تلاش 3: فقط پارامترهای ضروری
-        {
-            "prefix": "BINANCE", "ticker": su,
-            "currency": "USDT", "basecurrency": base,
-            "type": "crypto", "mintick": tick,
-        },
-    ]:
-        try:
-            return SymInfo(**params)
-        except TypeError as e:
-            continue
-        except Exception as e:
-            continue
-
-    # اگر هیچکدام کار نکرد -> dict fallback
-    logger.warning(f"[PYNE_BRIDGE] هیچکدام از پارامترهای SymInfo کار نکرد، از dict استفاده می‌شود")
-    return {
-        "prefix": "BINANCE", "ticker": su, "currency": "USDT",
-        "basecurrency": base, "type": "crypto", "mintick": tick,
-        "pointvalue": 1.0, "timezone": "UTC",
-    }
+    
+    # ============================================================
+    # ساخت SymInfo با پارامترهای دقیق
+    # ============================================================
+    try:
+        return SymInfo(
+            prefix="BINANCE",
+            description=f"{base} / USDT",
+            ticker=su,
+            currency="USDT",
+            basecurrency=base,
+            period="1m",
+            type="crypto",
+            volume_type="quote",
+            mintick=tick,
+            pricescale=100,
+            minmove=1,
+            pointvalue=1.0,
+            mincontract=min_contract,
+            opening_hours=[],
+            session_starts=[],
+            session_ends=[],
+            timezone="UTC",
+        )
+    except Exception as e:
+        logger.warning(f"[PYNE_BRIDGE] ساخت SymInfo با خطا مواجه شد: {e}")
+        # Fallback به dict
+        return {
+            "prefix": "BINANCE",
+            "ticker": su,
+            "currency": "USDT",
+            "basecurrency": base,
+            "period": "1m",
+            "type": "crypto",
+            "mintick": tick,
+            "pointvalue": 1.0,
+        }
 
 # =====================================================================================
 # تابع اصلی
@@ -222,7 +234,6 @@ def run_pyne_indicator(
     if df is None or df.empty:
         return None
 
-    # ✅ تبدیل به Path (رفع خطای 'str' object has no attribute 'parent')
     script_path = Path(script_path)
     if not script_path.exists():
         logger.error(f"[PYNE_BRIDGE] فایل اسکریپت پیدا نشد: {script_path}")
