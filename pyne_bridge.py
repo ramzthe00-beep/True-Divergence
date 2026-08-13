@@ -227,20 +227,15 @@ def _build_security_data(
         logger.warning(f"[PYNE_BRIDGE] ساخت داده‌ی MTF ناموفق بود، بدون آن ادامه می‌دهیم: {e}")
         return None
 
-
 def _build_syminfo(symbol: str) -> Any:
-    """
-    ساخت شیء SymInfo برای ScriptRunner. مقادیر پیش‌فرض برای فیوچرز
-    کریپتوی USDT-margined در نظر گرفته شده‌اند — در صورت نیاز اصلاح کنید.
-    """
+   
     tick = 0.01
     su = symbol.upper()
     if su == "DOGEUSDT":
         tick = 0.00001
 
-    if SymInfo is not None:
-        try:
-            return SymInfo(
+    
+    return SymInfo(
                 symtype="crypto",
                 prefix="BINANCE",
                 ticker=su,
@@ -261,6 +256,7 @@ def _build_syminfo(symbol: str) -> Any:
         "symtype": "crypto", "prefix": "BINANCE", "ticker": su,
         "currency": "USDT", "mintick": tick, "timezone": "UTC",
     }
+
 
 
 # =====================================================================================
