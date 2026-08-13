@@ -20,7 +20,7 @@ import pandas as pd
 logger = logging.getLogger(__name__)
 
 # =====================================================================================
-# Import ایمن PyneCore — نبود کتابخانه نباید بات را کرش بدهد
+# Import PyneCore با مسیرهای صحیح (طبق مستندات رسمی)
 # =====================================================================================
 PYNECORE_AVAILABLE = True
 _import_error: Optional[BaseException] = None
@@ -30,6 +30,9 @@ OHLCV: Any = None
 SymInfo: Any = None
 pyne_na: Any = None
 
+# ============================================================
+# ✅ مسیرهای صحیح Import - مطابق مستندات رسمی PyneCore
+# ============================================================
 try:
     from pynecore.core.script_runner import ScriptRunner as _ScriptRunner
     ScriptRunner = _ScriptRunner
@@ -42,17 +45,30 @@ except ImportError as e1:
         _import_error = e2
 
 try:
+    from pynecore.core.syminfo import SymInfo as _SymInfo
+    SymInfo = _SymInfo
+except ImportError as e1:
+    try:
+        from pynecore import SymInfo as _SymInfo
+        SymInfo = _SymInfo
+    except ImportError as e2:
+        try:
+            from pynecore.types.syminfo import SymInfo as _SymInfo
+            SymInfo = _SymInfo
+        except ImportError as e3:
+            PYNECORE_AVAILABLE = False
+            _import_error = _import_error or e3
+
+try:
     from pynecore.types.ohlcv import OHLCV as _OHLCV
     OHLCV = _OHLCV
 except ImportError as e:
-    PYNECORE_AVAILABLE = False
-    _import_error = _import_error or e
-
-try:
-    from pynecore.types.syminfo import SymInfo as _SymInfo
-    SymInfo = _SymInfo
-except ImportError as e:
-    logger.warning(f"[PYNE_BRIDGE] SymInfo import نشد، از dict fallback استفاده می‌شود: {e}")
+    try:
+        from pynecore import OHLCV as _OHLCV
+        OHLCV = _OHLCV
+    except ImportError:
+        PYNECORE_AVAILABLE = False
+        _import_error = _import_error or e
 
 try:
     from pynecore.lib import na as _pyne_na
@@ -167,62 +183,78 @@ def _build_security_data(
 
 
 # =====================================================================================
-# 🔧 اصلاح شده: تابع _build_syminfo با SymInfo واقعی
+# 🔧 ✅ اصلاح قطعی: ساخت SymInfo مطابق مستندات رسمی PyneCore
 # =====================================================================================
 def _build_syminfo(symbol: str) -> Any:
     """
     ساخت شیء SymInfo برای ScriptRunner.
-    مطابق مستندات رسمی PyneCore و pynecore-examples.
+    مطابق مستندات رسمی PyneCore و نمونه‌های گیت‌هاب.
     """
-    tick = 0.01
-    su = symbol.upper()
-    base = su.replace("USDT", "")
+    if SymInfo is None:
+        # اگر SymInfo در دسترس نیست، fallback به dict
+        su = symbol.upper()
+        base = su.replace("USDT", "")
+        tick = 0.00001 if su == "DOGEUSDT" else 0.01
+        return {
+            "prefix": "BINANCE",
+            "ticker": su,
+            "currency": "USDT",
+            "basecurrency": base,
+            "type": "crypto",
+            "mintick": tick,
+            "pointvalue": 1.0,
+            "timezone": "UTC",
+        }
     
-    if su == "DOGEUSDT":
-        tick = 0.00001
-    elif su == "LTCUSDT":
-        tick = 0.01
-    elif su == "ETHUSDT":
-        tick = 0.01
-    
-    # ============================================================
-    # تلاش برای ساخت SymInfo واقعی (مطابق مستندات PyneCore)
-    # ============================================================
-    if SymInfo is not None:
-        try:
-            return SymInfo(
-                prefix="BINANCE",
-                description=f"{base} / USDT",
-                ticker=su,
-                currency="USDT",
-                basecurrency=base,
-                type="crypto",
-                mintick=tick,
-                pricescale=100,
-                minmove=1,
-                pointvalue=1.0,
-                timezone="UTC",
-                volumetype="quote",
-            )
-        except TypeError as e:
-            logger.warning(
-                f"[PYNE_BRIDGE] امضای سازنده‌ی SymInfo با آنچه فرض شده مطابقت ندارد ({e}). "
-                f"از dict fallback استفاده می‌شود."
-            )
-    
-    # ============================================================
-    # Fallback: برگرداندن dict ساده (برای نسخه‌های قدیمی PyneCore)
-    # ============================================================
-    return {
-        "prefix": "BINANCE",
-        "ticker": su,
-        "currency": "USDT",
-        "basecurrency": base,
-        "type": "crypto",
-        "mintick": tick,
-        "pointvalue": 1.0,
-        "timezone": "UTC",
-    }
+    try:
+        # ساخت SymInfo با پارامترهای کامل (مطابق مثال‌های رسمی)
+        su = symbol.upper()
+        base = su.replace("USDT", "")
+        
+        # تعیین tick size بر اساس نماد
+        if su == "DOGEUSDT":
+            tick = 0.00001
+        elif su == "LTCUSDT":
+            tick = 0.01
+        elif su == "ETHUSDT":
+            tick = 0.01
+        else:
+            tick = 0.01
+        
+        return SymInfo(
+            prefix="BINANCE",
+            description=f"{base} / USDT",
+            ticker=su,
+            currency="USDT",
+            basecurrency=base,
+            type="crypto",
+            mintick=tick,
+            pricescale=100,
+            minmove=1,
+            pointvalue=1.0,
+            mincontract=0.00001 if base == "BTC" else 0.0001,
+            timezone="UTC",
+            volumetype="quote",
+            opening_hours=[],
+            session_starts=[],
+            session_ends=[],
+        )
+    except Exception as e:
+        logger.warning(f"[PYNE_BRIDGE] ساخت SymInfo با خطا مواجه شد: {e}")
+        # Fallback: برگرداندن dict ساده
+        su = symbol.upper()
+        base = su.replace("USDT", "")
+        tick = 0.00001 if su == "DOGEUSDT" else 0.01
+        return {
+            "prefix": "BINANCE",
+            "ticker": su,
+            "currency": "USDT",
+            "basecurrency": base,
+            "type": "crypto",
+            "mintick": tick,
+            "pointvalue": 1.0,
+            "timezone": "UTC",
+        }
 
 
 # =====================================================================================
