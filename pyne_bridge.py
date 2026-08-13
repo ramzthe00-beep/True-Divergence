@@ -241,7 +241,8 @@ def run_pyne_indicator(
         return None
 
     syminfo_obj = _build_syminfo(symbol)
-    security_data = _build_security_data(df, mtf_timeframe)
+    # security_data = _build_security_data(df, mtf_timeframe)
+    security_data = None  # MTF غیرفعال هست
 
     runner = None
     last_err: Optional[Exception] = None
