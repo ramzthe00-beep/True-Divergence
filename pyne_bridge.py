@@ -195,7 +195,7 @@ def _build_syminfo(symbol: str) -> Any:
             basecurrency=base,
             period="1m",
             type="crypto",
-            volume_type="quote",
+            volumetype="quote",           # ✅ اصلاح شد: volume_type → volumetype
             mintick=tick,
             pricescale=100,
             minmove=1,
