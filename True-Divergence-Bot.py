@@ -186,10 +186,15 @@ class TrueTradePrivateExchange:
             "X-Signature": signature,
             "Content-Type": "application/json"
         }
-        response = self.session.request(method, f"{self.base_url}{uri}", headers=headers, json=data, timeout=15)
-        
+        if uri.startswith('/futures'):
+            full_url = f"https://apiv2.thetruetrade.io{uri}"
+        else:
+            full_url = f"{self.base_url}{uri}"
+    
+        response = self.session.request(method, full_url, headers=headers, json=data, timeout=15)
+    
         self._last_response = response
-        
+    
         if not response.ok:
             if response.status_code in [401, 403]:
                 self.connected = False
@@ -198,6 +203,7 @@ class TrueTradePrivateExchange:
         else:
             self.connected = True
         return response.json()
+    
 
     def test_connection(self):
         try:
