@@ -6,42 +6,6 @@ pyne_bridge.py — پل ادغام PyneCore با بات معاملاتی (DataFr
 از طریق ScriptRunner رسمی روی یک pandas.DataFrame (OHLCV با ایندکس
 datetime) اجرا می‌کند و خروجی plot/plotshape آن را به‌صورت dict از
 pd.Series برمی‌گرداند.
-
-⚠️ چند نکته‌ی مهم و صادقانه پیش از استفاده در Production
-----------------------------------------------------------------------
-1) فایلی که شما آپلود کردید (dtm.py) در واقع همان *اسکریپت کامپایل‌شده‌ی
-   PyneCore* است (یک @script.strategy با ورودی‌های Pivot/RSI/MACD/...
-   و ۴ خروجی plotshape: CD-/CD+/HD+/HD-)، نه فایل ارکستریتور بات (که در
-   پیام شما به‌صورت متن جدا پیست شده بود). پیشنهاد می‌کنم این فایل را
-   با نامی مثل `dtm_pyne_strategy.py` نگه دارید تا با فایل اصلی بات
-   (که «dtm.py» نامیده‌اید) تداخل نداشته باشد.
-
-2) API برنامه‌نویسی PyneCore («Programmatic Usage» / ScriptRunner) نسبتاً
-   جدید و در حال تکامل است. جزئیات زیر مطابق مستندات رسمی pynecore.org
-   (بررسی‌شده در تاریخ نگارش این فایل) پیاده‌سازی شده‌اند:
-       - ScriptRunner(script_path, ohlcv_iter, syminfo)
-       - runner.run_iter() → یک generator که برای هر بار (candle, plot)
-         را برمی‌گرداند (یا (candle, plot, new_closed_trades) برای
-         اسکریپت‌های @script.strategy مثل مال شما)
-       - OHLCV(timestamp, open, high, low, close, volume) — timestamp
-         باید ثانیه‌ی یونیکس باشد، نه میلی‌ثانیه
-       - NA باید با تابع pynecore.lib.na بررسی شود، نه با `is None`
-   با این‌حال، امضای دقیق SymInfo و نحوه‌ی تزریق داده‌ی Multi-Timeframe
-   (security_data) ممکن است بین نسخه‌های PyneCore کمی فرق کند؛ به همین
-   دلیل هر دو مورد در try/except با fallback واضح پیاده‌سازی شده‌اند.
-
-3) اسکریپت کامپایل‌شده‌ی شما فقط ۴ فلگ boolean منتشر می‌کند و
-   entry/stop/target تولید نمی‌کند (strategy.entry با SL/TP در آن
-   فراخوانی نشده). بنابراین طبق درخواست شما (نیازمندی ۴)، این پل فقط
-   سیگنال نهایی (BUY/SELL) را استخراج می‌کند و محاسبه‌ی entry/stop/target
-   همچنان بر عهده‌ی منطق pivot-state موجود در detect_signal شما می‌ماند
-   — دقیقاً همان‌طور که خواسته بودید، بدون دست‌زدن به بقیه‌ی بات.
-
-4) این ماژول کاملاً Fail-Safe طراحی شده: اگر PyneCore نصب نباشد، اسکریپت
-   پیدا نشود، یا اجرا با خطا مواجه شود، همه‌جا `None` برمی‌گرداند و فقط
-   لاگ می‌کند — هرگز Exception خام به بیرون پرتاب نمی‌کند تا حلقه‌ی
-   اصلی بات (main_loop) هرگز به خاطر این ماژول متوقف نشود.
-----------------------------------------------------------------------
 """
 
 from __future__ import annotations
@@ -71,7 +35,7 @@ try:
     ScriptRunner = _ScriptRunner
 except ImportError as e1:
     try:
-        from pynecore import ScriptRunner as _ScriptRunner  # مسیر جایگزین احتمالی
+        from pynecore import ScriptRunner as _ScriptRunner
         ScriptRunner = _ScriptRunner
     except ImportError as e2:
         PYNECORE_AVAILABLE = False
@@ -88,26 +52,23 @@ try:
     from pynecore.types.syminfo import SymInfo as _SymInfo
     SymInfo = _SymInfo
 except ImportError as e:
-    # نبودنش کشنده نیست؛ در ادامه با dict هم تلاش می‌کنیم.
     logger.warning(f"[PYNE_BRIDGE] SymInfo import نشد، از dict fallback استفاده می‌شود: {e}")
 
 try:
     from pynecore.lib import na as _pyne_na
     pyne_na = _pyne_na
 except ImportError:
-    pyne_na = None  # فقط برای مدیریت NA بهتر استفاده می‌شود؛ نبودنش بلاک‌کننده نیست
+    pyne_na = None
 
 if not PYNECORE_AVAILABLE:
     logger.error(
         f"[PYNE_BRIDGE] PyneCore در دسترس نیست ({_import_error}). "
         f"سیگنال‌گیری از PyneCore غیرفعال می‌شود و بات به‌صورت خودکار "
-        f"به منطق تشخیص داخلی خودش fallback می‌کند. برای فعال‌سازی: "
-        f"pip install pynesys-pynecore --break-system-packages"
+        f"به منطق تشخیص داخلی خودش fallback می‌کند."
     )
 
 # =====================================================================================
 # نگاشت نام سیگنال pine (نام plotshape در اسکریپت کامپایل‌شده) → جهت معامله
-# اگر عنوان plotshape در اسکریپت خودتان را عوض کرده‌اید، همین‌جا آپدیت کنید.
 # =====================================================================================
 SIGNAL_PLOT_MAP: Dict[str, Dict[str, str]] = {
     "CD-": {"side": "SELL", "label": "Classic Bearish"},
@@ -118,15 +79,10 @@ SIGNAL_PLOT_MAP: Dict[str, Dict[str, str]] = {
 
 
 # =====================================================================================
-# مدیریت NA — نیازمندی شماره ۵
-# نکته‌ی حیاتی: مقدار NA در PyneCore هرگز نباید با `value is None` یا
-# `value == None` مقایسه شود. باید یا از pynecore.lib.na() استفاده کرد،
-# یا (چون خروجی نهایتاً باید در pandas بنشیند) آن را به np.nan تبدیل کرد
-# و از pd.isna() برای بررسی استفاده کرد — دقیقاً همان چیزی که این توابع
-# انجام می‌دهند.
+# مدیریت NA
 # =====================================================================================
 def _pyne_value_is_na(value: Any) -> bool:
-    """بررسی صحیح NA بودن یک مقدار خروجی از PyneCore (نه مقایسه با None)."""
+    """بررسی صحیح NA بودن یک مقدار خروجی از PyneCore."""
     if value is None:
         return True
     if pyne_na is not None:
@@ -138,7 +94,7 @@ def _pyne_value_is_na(value: Any) -> bool:
     try:
         return bool(np.isnan(float(value)))
     except (TypeError, ValueError):
-        return False  # مقادیر غیرعددی (مثل bool صریح) هرگز na نیستند
+        return False
 
 
 def _pyne_to_float(value: Any) -> float:
@@ -152,10 +108,7 @@ def _pyne_to_float(value: Any) -> float:
 
 
 def _pyne_to_bool(value: Any) -> bool:
-    """
-    تبدیل امن یک مقدار bool خروجی PyneCore (مثل شرط plotshape) به bool.
-    NA/None محافظه‌کارانه False تلقی می‌شود، چون یعنی «سیگنالی صادر نشده».
-    """
+    """تبدیل امن یک مقدار bool خروجی PyneCore به bool."""
     if _pyne_value_is_na(value):
         return False
     if isinstance(value, bool):
@@ -167,14 +120,11 @@ def _pyne_to_bool(value: Any) -> bool:
 
 
 # =====================================================================================
-# DataFrame Bridge: تبدیل pandas.DataFrame → ایتریتور OHLCV مورد نیاز ScriptRunner
+# DataFrame Bridge: تبدیل pandas.DataFrame → ایتریتور OHLCV
 # =====================================================================================
 def _dataframe_to_ohlcv_iter(df: pd.DataFrame) -> Iterator[Any]:
     """
-    هر ردیف از DataFrame (ایندکس datetime، ستون‌های open/high/low/close/volume)
-    را به یک آبجکت OHLCV(timestamp, open, high, low, close, volume) تبدیل می‌کند.
-    طبق مستندات رسمی PyneCore، timestamp باید بر حسب ثانیه‌ی یونیکس باشد
-    (نه میلی‌ثانیه).
+    هر ردیف از DataFrame را به یک آبجکت OHLCV تبدیل می‌کند.
     """
     if OHLCV is None:
         raise RuntimeError("pynecore.types.ohlcv.OHLCV در دسترس نیست.")
@@ -199,19 +149,7 @@ def _dataframe_to_ohlcv_iter(df: pd.DataFrame) -> Iterator[Any]:
 def _build_security_data(
     df: pd.DataFrame, mtf_timeframe: str = "240"
 ) -> Optional[Dict[str, List[Any]]]:
-    """
-    اسکریپت کامپایل‌شده‌ی شما صرف‌نظر از مقدار enableMTF، هر بار
-    request.security(..., mtfTimeframe, ...) را فراخوانی می‌کند. برای
-    این‌که اجرا خطا ندهد، این تابع داده‌ی تایم‌فریم بالاتر (پیش‌فرض ۴h)
-    را از همان دیتافریم ۱ دقیقه‌ای resample می‌کند.
-
-    ⚠️ best-effort: نحوه‌ی دقیق پاس‌دادن این داده به ScriptRunner ممکن
-    است بین نسخه‌ها فرق کند (به سند «Providing Security Data» در
-    pynecore.org مراجعه کنید). اگر ScriptRunner نسخه‌ی شما این پارامتر
-    را نمی‌پذیرد، run_pyne_indicator خودکار بدون آن هم تلاش می‌کند و
-    چون enableMTF پیش‌فرض False است، منطق نهایی سیگنال تحت تأثیر قرار
-    نمی‌گیرد (mtfFilterOk = not enableMTF or ... همیشه True می‌ماند).
-    """
+    """ساخت داده‌های MTF برای request.security."""
     try:
         resample_map = {"240": "4h", "60": "1h", "30": "30min", "15": "15min", "D": "1D", "W": "1W"}
         rule = resample_map.get(mtf_timeframe, "4h")
@@ -227,15 +165,21 @@ def _build_security_data(
         logger.warning(f"[PYNE_BRIDGE] ساخت داده‌ی MTF ناموفق بود، بدون آن ادامه می‌دهیم: {e}")
         return None
 
+
 def _build_syminfo(symbol: str) -> Any:
-   
+    """
+    ساخت شیء SymInfo برای ScriptRunner.
+    اگر SymInfo در دسترس نباشد، از dict ساده استفاده می‌کند.
+    """
     tick = 0.01
     su = symbol.upper()
     if su == "DOGEUSDT":
         tick = 0.00001
 
-    
-    return SymInfo(
+    # تلاش برای ساخت SymInfo واقعی
+    if SymInfo is not None:
+        try:
+            return SymInfo(
                 symtype="crypto",
                 prefix="BINANCE",
                 ticker=su,
@@ -251,16 +195,20 @@ def _build_syminfo(symbol: str) -> Any:
                 f"فرض شده مطابقت ندارد ({e}). فیلدهای واقعی را با دستور زیر بررسی کنید:\n"
                 f'    python -c "from pynecore.types.syminfo import SymInfo; help(SymInfo)"'
             )
-    # Fallback: برخی نسخه‌ها یک dict ساده را هم می‌پذیرند
+
+    # Fallback: برگرداندن dict ساده
     return {
-        "symtype": "crypto", "prefix": "BINANCE", "ticker": su,
-        "currency": "USDT", "mintick": tick, "timezone": "UTC",
+        "symtype": "crypto",
+        "prefix": "BINANCE",
+        "ticker": su,
+        "currency": "USDT",
+        "mintick": tick,
+        "timezone": "UTC",
     }
 
 
-
 # =====================================================================================
-# تابع اصلی — نیازمندی شماره ۱ و ۲
+# تابع اصلی
 # =====================================================================================
 def run_pyne_indicator(
     df: pd.DataFrame,
@@ -269,25 +217,7 @@ def run_pyne_indicator(
     mtf_timeframe: str = "240",
 ) -> Optional[Dict[str, pd.Series]]:
     """
-    اجرای اسکریپت کامپایل‌شده‌ی PyneCore (ScriptRunner رسمی) روی یک
-    DataFrame پانداس و بازگرداندن خروجی‌های plot/plotshape آن به‌صورت
-    dict از pd.Series هم‌طول و هم‌ترتیب با انتهای df.
-
-    Args:
-        df: DataFrame با ایندکس datetime (UTC) و ستون‌های
-            open/high/low/close/volume — دقیقاً همان چیزی که
-            TrueTradePublicData.fetch_ohlcv برمی‌گرداند.
-        script_path: مسیر فایل کامپایل‌شده‌ی PyneCore (مثلاً
-            dtm_pyne_strategy.py).
-        symbol: نماد معاملاتی (برای ساخت SymInfo).
-        mtf_timeframe: تایم‌فریم بالاتر مورد استفاده در request.security
-            اسکریپت (پیش‌فرض "240" = ۴ ساعته، مطابق مقدار پیش‌فرض
-            ورودی mtfTimeframe در اسکریپت شما).
-
-    Returns:
-        dict[str, pd.Series] در صورت موفقیت، یا None در هر حالت خطا/
-        نبود PyneCore (fail-safe — فراخوان باید در این حالت به منطق
-        تشخیص داخلی خودش fallback کند).
+    اجرای اسکریپت کامپایل‌شده‌ی PyneCore روی یک DataFrame.
     """
     if not PYNECORE_AVAILABLE or ScriptRunner is None:
         return None
@@ -304,7 +234,6 @@ def run_pyne_indicator(
 
     runner = None
     last_err: Optional[Exception] = None
-    # تلاش اول: با داده‌ی MTF (اگر ساخته شده باشد) — تلاش دوم: بدون آن
     attempts = ([{"security_data": security_data}] if security_data else []) + [{}]
     for kwargs in attempts:
         try:
@@ -318,7 +247,7 @@ def run_pyne_indicator(
             return None
 
     if runner is None:
-        logger.error(f"[PYNE_BRIDGE] هیچ‌کدام از تلاش‌های ساخت ScriptRunner موفق نشد: {last_err}")
+        logger.error(f"[PYNE_BRIDGE] ساخت ScriptRunner ناموفق بود: {last_err}")
         return None
 
     plot_columns: Dict[str, List[Any]] = {}
@@ -326,13 +255,11 @@ def run_pyne_indicator(
 
     try:
         for result in runner.run_iter():
-            # اندیکاتور: (candle, plot) | استراتژی: (candle, plot, new_closed_trades)
             plot_data = result[1]
             n_bars += 1
             keys = list(plot_data.keys()) if hasattr(plot_data, "keys") else list(dict(plot_data).keys())
             for key in keys:
                 plot_columns.setdefault(key, []).append(plot_data.get(key))
-            # هم‌طول نگه‌داشتن ستون‌هایی که در این بار مقدار نداشتند
             for key in list(plot_columns.keys()):
                 if len(plot_columns[key]) < n_bars:
                     plot_columns[key].append(float("nan"))
@@ -341,11 +268,7 @@ def run_pyne_indicator(
         return None
 
     if n_bars == 0 or not plot_columns:
-        logger.warning(
-            "[PYNE_BRIDGE] اسکریپت اجرا شد ولی هیچ plot/plotshape ای برنگرداند. "
-            "اگر عناوین (title) در plotshape() اسکریپت شما با SIGNAL_PLOT_MAP "
-            "مطابقت ندارد، آن‌ها را در بالای این فایل تنظیم کنید."
-        )
+        logger.warning("[PYNE_BRIDGE] اسکریپت اجرا شد ولی هیچ plot/plotshape ای برنگرداند.")
         return None
 
     aligned_index = df.index[-n_bars:]
@@ -362,24 +285,13 @@ def run_pyne_indicator(
 
 
 # =====================================================================================
-# استخراج «فقط سیگنال نهایی» — نیازمندی شماره ۴
+# استخراج «فقط سیگنال نهایی»
 # =====================================================================================
 def extract_final_signal(
     plots: Optional[Dict[str, pd.Series]],
 ) -> Optional[Dict[str, Optional[str]]]:
     """
-    از خروجی run_pyne_indicator، سیگنال نهایی روی آخرین کندل بسته‌شده را
-    استخراج می‌کند.
-
-    ⚠️ صادقانه: اسکریپت کامپایل‌شده‌ی dtm_pyne_strategy.py فقط ۴ فلگ
-    boolean (CD-/CD+/HD+/HD-) را منتشر می‌کند و entry/stop/target تولید
-    نمی‌کند. بنابراین این تابع فقط signal/side/label برمی‌گرداند —
-    entry/stop/target طبق درخواست شما همچنان توسط منطق pivot-state
-    موجود در detect_signal بات (بدون تغییر) محاسبه می‌شود.
-
-    Returns:
-        {"signal": "BUY"|"SELL"|None, "label": str|None} یا None اگر
-        داده در دسترس نباشد.
+    از خروجی run_pyne_indicator، سیگنال نهایی روی آخرین کندل بسته‌شده را استخراج می‌کند.
     """
     if not plots:
         return None
@@ -390,14 +302,13 @@ def extract_final_signal(
             continue
         last_val = series.iloc[-1]
         if _pyne_to_bool(last_val):
-            # اسکریپت پاین در هر بار حداکثر یکی از این ۴ حالت را True می‌کند
             return {"signal": meta["side"], "label": meta["label"]}
 
     return {"signal": None, "label": None}
 
 
 # =====================================================================================
-# تست مستقل سریع (اختیاری) — برای اطمینان از صحت اتصال قبل از وصل‌کردن به بات
+# تست مستقل سریع
 # =====================================================================================
 if __name__ == "__main__":
     import sys
