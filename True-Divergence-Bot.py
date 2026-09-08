@@ -22,6 +22,7 @@ DTM v6 FC — Divergence + Golden/Death Cross Signal Bot   (نسخه ۴ — Pine
   • div_hist = False برای برابری ۱۰۰٪ با Pine
   • پیام استارتاپ به‌روزرسانی شد
   • ✅ جلوگیری از ارسال سیگنال‌های گذشته در اولین اجرا
+  • ✅ SSL Hybrid با لاگ تخصصی و ارسال به تلگرام
 """
 
 import os
@@ -36,6 +37,7 @@ from datetime import datetime, timezone, timedelta
 from flask import Flask
 import json
 import logging
+import traceback
 
 logging.basicConfig(
     level=logging.INFO,
@@ -62,6 +64,29 @@ if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
 HISTORY_FILE = "trades_history_dtm_v6.json"
 STATE_FILE = "pivot_state_dtm_v6.json"
 
+# ============================================
+# ★ Import SSL Hybrid با مدیریت خطا
+# ============================================
+SSL_AVAILABLE = False
+SSL_ERROR = None
+SSL_ERROR_DETAIL = None
+
+try:
+    import ssl_hybrid
+    from ssl_hybrid import main as ssl_hybrid_indicator
+    SSL_AVAILABLE = True
+    logger.info("[SSL] ✅ ssl_hybrid.py loaded successfully")
+except ImportError as e:
+    SSL_AVAILABLE = False
+    SSL_ERROR = "ImportError"
+    SSL_ERROR_DETAIL = str(e)
+    logger.error(f"[SSL] ❌ Failed to import ssl_hybrid.py: {e}")
+except Exception as e:
+    SSL_AVAILABLE = False
+    SSL_ERROR = type(e).__name__
+    SSL_ERROR_DETAIL = str(e)
+    logger.error(f"[SSL] ❌ Error loading ssl_hybrid.py: {e}")
+
 # ═══════════════════════════════════════════════════════════════
 # ★ LIVE MODE — فقط معاملات جدید از لحظه اجرا
 # ═══════════════════════════════════════════════════════════════
@@ -87,9 +112,9 @@ def reset_state_for_live_mode():
     
     # ریست شمارنده
     SIGNAL_COUNTER = 0
-    FIRST_RUN = True  # reset first run flag
+    FIRST_RUN = True
     logger.info("[LIVE] Mode activated - processing only new data from now on")
-  
+
 # =====================================================================================
 # هشتگ‌ها
 # =====================================================================================
@@ -110,6 +135,7 @@ HASHTAGS = {
     "connection": "#Connected",
     "connection_change": "#Reconnected",
     "capital_reduced": "#LowCapital",
+    "ssl_status": "#SSL",
 }
 
 # =====================================================================================
@@ -602,15 +628,35 @@ def resolve_bar_from_ts(df_indexed, ts):
     return None
 
 # =====================================================================================
-# فیلتر روند SSL Hybrid
+# ★ فیلتر روند SSL Hybrid — با PyneCore (دقیقاً مثل Pine Script)
 # =====================================================================================
 def compute_ssl_hlv(df_5m):
     """
     محاسبه SSL Hybrid با استفاده از PyneCore
     دقیقاً مطابق با کد Pine Script اصلی
+    
+    اگر ssl_hybrid.py خطا بده → None برمی‌گردونه و سیگنال‌دهی متوقف می‌شود
     """
+    global SSL_AVAILABLE, SSL_ERROR, SSL_ERROR_DETAIL
+    
     if df_5m is None or len(df_5m) < SSL_BASELINE_LEN + 5:
-        return 0
+        return None
+    
+    if not SSL_AVAILABLE:
+        error_msg = (
+            f"❌ *SSL Hybrid غیرفعال است* {HASHTAGS['ssl_status']}\n"
+            f"━━━━━━━━━━━━━━━━━━━━━━\n"
+            f"📌 وضعیت: **غیرفعال**\n"
+            f"🔴 خطا: `{SSL_ERROR}`\n"
+            f"📝 جزئیات: `{SSL_ERROR_DETAIL}`\n"
+            f"━━━━━━━━━━━━━━━━━━━━━━\n"
+            f"⚠️ به دلیل این خطا، **هیچ سیگنالی** از ربات ارسال نمی‌شود.\n"
+            f"🛠️ برای رفع مشکل، فایل `ssl_hybrid.py` را بررسی کنید.\n"
+            f"🕒 {format_iran_time()}"
+        )
+        logger.error(f"[SSL] {error_msg}")
+        send_telegram_message(error_msg)
+        return None
     
     try:
         data = {
@@ -622,7 +668,6 @@ def compute_ssl_hlv(df_5m):
         }
         
         result = ssl_hybrid_indicator(data)
-        
         hlv = result.get('hlv')
         
         if hlv is not None and len(hlv) > 0:
@@ -634,14 +679,68 @@ def compute_ssl_hlv(df_5m):
             else:
                 return 0
         
-        logger.warning("[SSL] PyneCore returned no valid hlv, using fallback")
-        return compute_ssl_hlv_fallback(df_5m)
+        # اگر hlv معتبر نبود
+        error_msg = (
+            f"⚠️ *SSL Hybrid مقدار نامعتبر برگرداند* {HASHTAGS['ssl_status']}\n"
+            f"━━━━━━━━━━━━━━━━━━━━━━\n"
+            f"📌 وضعیت: **خطا در محاسبه**\n"
+            f"🔴 hlv مقدار: `{hlv}`\n"
+            f"━━━━━━━━━━━━━━━━━━━━━━\n"
+            f"⚠️ به دلیل این خطا، **هیچ سیگنالی** از ربات ارسال نمی‌شود.\n"
+            f"🕒 {format_iran_time()}"
+        )
+        logger.error(f"[SSL] {error_msg}")
+        send_telegram_message(error_msg)
+        return None
         
     except Exception as e:
-        logger.error(f"[SSL] Error in PyneCore SSL Hybrid: {e}")
-        return compute_ssl_hlv_fallback(df_5m)
+        tb = traceback.format_exc()
+        SSL_ERROR = type(e).__name__
+        SSL_ERROR_DETAIL = str(e)
+        SSL_AVAILABLE = False
+        
+        error_msg = (
+            f"❌ *SSL Hybrid خطا داد* {HASHTAGS['ssl_status']}\n"
+            f"━━━━━━━━━━━━━━━━━━━━━━\n"
+            f"📌 وضعیت: **غیرفعال**\n"
+            f"🔴 نوع خطا: `{type(e).__name__}`\n"
+            f"📝 پیام خطا: `{str(e)}`\n"
+            f"━━━━━━━━━━━━━━━━━━━━━━\n"
+            f"📋 **Traceback:**\n"
+            f"```\n{tb[:1500]}\n```\n"
+            f"━━━━━━━━━━━━━━━━━━━━━━\n"
+            f"⚠️ به دلیل این خطا، **هیچ سیگنالی** از ربات ارسال نمی‌شود.\n"
+            f"🛠️ لطفاً فایل `ssl_hybrid.py` را بررسی و اصلاح کنید.\n"
+            f"🕒 {format_iran_time()}"
+        )
+        logger.error(f"[SSL] {error_msg}")
+        send_telegram_message(error_msg)
+        return None
 
-
+def compute_ssl_hybrid_status():
+    """گزارش وضعیت SSL Hybrid برای نمایش در استارتاپ"""
+    if SSL_AVAILABLE:
+        return (
+            f"✅ *SSL Hybrid فعال است* {HASHTAGS['ssl_status']}\n"
+            f"━━━━━━━━━━━━━━━━━━━━━━\n"
+            f"📌 وضعیت: **فعال**\n"
+            f"🟢 فایل `ssl_hybrid.py` با موفقیت بارگذاری شد.\n"
+            f"🔄 سیگنال‌دهی با فیلتر SSL Hybrid انجام می‌شود.\n"
+            f"━━━━━━━━━━━━━━━━━━━━━━\n"
+            f"🕒 {format_iran_time()}"
+        )
+    else:
+        return (
+            f"❌ *SSL Hybrid غیرفعال است* {HASHTAGS['ssl_status']}\n"
+            f"━━━━━━━━━━━━━━━━━━━━━━\n"
+            f"📌 وضعیت: **غیرفعال**\n"
+            f"🔴 خطا: `{SSL_ERROR}`\n"
+            f"📝 جزئیات: `{SSL_ERROR_DETAIL}`\n"
+            f"━━━━━━━━━━━━━━━━━━━━━━\n"
+            f"⚠️ به دلیل این خطا، **هیچ سیگنالی** از ربات ارسال نمی‌شود.\n"
+            f"🛠️ برای رفع مشکل، فایل `ssl_hybrid.py` را بررسی کنید.\n"
+            f"🕒 {format_iran_time()}"
+        )
 
 # =====================================================================================
 # فیبوناچی
@@ -687,7 +786,9 @@ def check_hammer(df, pivot_bar):
     w_top = row['high'] - max(row['close'], row['open'])
     w_bot = min(row['close'], row['open']) - row['low']
     rng = row['high'] - row['low']
-    return rng > 0 and w_bot >= body * 2.0 and w_bot >= w_top * 2.0 and body < rng * 0.4# =====================================================================================
+    return rng > 0 and w_bot >= body * 2.0 and w_bot >= w_top * 2.0 and body < rng * 0.4
+
+# =====================================================================================
 # Helper: Check bar distance between two pivots
 # =====================================================================================
 def check_bar_distance(bar1, bar2):
@@ -1013,9 +1114,14 @@ def detect_signal(df_1m, df_5m, state, symbol, debug=False):
 
     # ------------------------------------------------------------------
     # ✅ فیلتر SSL Hybrid — تک‌تایم‌فریمی 5m — گیت روی همه سیگنال‌ها
-    # (مطابق Pine: gate_long = rssl_dir1==1 , gate_short = rssl_dir1==-1)
     # ------------------------------------------------------------------
     hlv = compute_ssl_hlv(df_5m)
+    
+    # ★ اگر hlv None باشه، یعنی SSL Hybrid خطا داده → سیگنال‌دهی متوقف
+    if hlv is None:
+        log("   ❌ SSL Hybrid Error - SIGNALS DISABLED")
+        return [], debug_log  # ← هیچ سیگنالی برنمی‌گردونه
+    
     gate_long = hlv == 1
     gate_short = hlv == -1
     log(f"   SSL(5m) Hlv={hlv} | gate_long={gate_long} gate_short={gate_short} | Hlv=0 → هر دو مسدود")
@@ -1405,7 +1511,7 @@ def analyze_and_execute():
             # ★★★ اگر اولین بار اجراست، فقط ۲ سیگنال آخر (جدیدترین) رو بگیر ★★★
             if FIRST_RUN and len(signals) > 2:
                 logger.info(f"[FIRST_RUN] {symbol}: {len(signals)} سیگنال یافت شد، فقط ۲ تای آخر ارسال می‌شوند")
-                signals = signals[-2:]  # فقط ۲ سیگنال آخر (جدیدترین)
+                signals = signals[-2:]
 
             # ★★★ اگر اولین بار اجراست و سیگنال وجود داره، فقط نمایش بده و معامله نکن ★★★
             for sig in signals:
@@ -1441,7 +1547,7 @@ def analyze_and_execute():
                         f"🕒 {format_iran_time()}"
                     )
                     send_telegram_message(signal_message)
-                    continue  # از این سیگنال صرف نظر کن و معامله نکن
+                    continue
 
                 # ★★★ پردازش عادی سیگنال (برای اجراهای بعدی) ★★★
                 entry = round_price(sig['entry'], symbol)
@@ -1582,14 +1688,14 @@ def main_loop():
     # ★★★ اگر اولین بار است، یک بار Analyze را با FIRST_RUN=True اجرا کن ★★★
     if FIRST_RUN:
         logger.info("[MAIN_LOOP] اولین اجرا - پردازش فقط داده‌های جدید")
-        analyze_and_execute()  # اینجا FIRST_RUN=True است و سیگنال‌ها فقط نمایش داده می‌شوند
+        analyze_and_execute()
         FIRST_RUN = False
         logger.info("[MAIN_LOOP] اولین اجرا کامل شد - وارد حلقه عادی می‌شویم")
 
     while True:
         try:
             logger.info(f"[LOOP] {format_iran_time()}")
-            analyze_and_execute()  # اینجا FIRST_RUN=False است
+            analyze_and_execute()
 
             today = format_iran_date()
             now = datetime.now(timezone(timedelta(hours=3, minutes=30)))
@@ -1829,9 +1935,11 @@ def analyze_last_24h_and_send_report():
 
 
 if __name__ == "__main__":
-    #global FIRST_RUN
-    
     logger.info("DTM v6 FC Bot Starting... (نسخه ۴ — Pine-Exact)")
+    
+    # ★ ارسال وضعیت SSL Hybrid در استارتاپ
+    ssl_status_msg = compute_ssl_hybrid_status()
+    send_telegram_message(ssl_status_msg)
     
     # ★ حالت لایو - ریست کامل state (قبل از هر چیز)
     if LIVE_MODE:
