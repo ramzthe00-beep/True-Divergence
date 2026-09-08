@@ -1538,20 +1538,167 @@ app = Flask(__name__)
 @app.route("/")
 def health():
     return "OK", 200
+# =====================================================================================
+# ★ قابلیت جدید: تحلیل ۲۴ ساعت اخیر بدون معامله
+# =====================================================================================
+def analyze_last_24h_and_send_report():
+    """
+    تحلیل ۲۴ ساعت اخیر، ذخیره سیگنال‌ها در فایل و ارسال به تلگرام
+    فقط یک بار اجرا می‌شود و هیچ معامله‌ای انجام نمی‌دهد
+    """
+    logger.info("[ANALYZE_24H] شروع تحلیل ۲۴ ساعت اخیر...")
+    
+    # ۱. تاریخ و ساعت فعلی
+    now = datetime.now(timezone(timedelta(hours=3, minutes=30)))
+    now_str = now.strftime('%Y-%m-%d %H:%M:%S')
+    cutoff_time = now - timedelta(hours=24)
+    cutoff_str = cutoff_time.strftime('%Y-%m-%d %H:%M:%S')
+    
+    send_telegram_message(
+        f"📊 *تحلیل ۲۴ ساعت اخیر* {HASHTAGS['diagnostic']}\n"
+        f"━━━━━━━━━━━━━━━━━━━━━━\n"
+        f"🕐 از: `{cutoff_str}`\n"
+        f"🕐 تا: `{now_str}`\n"
+        f"📌 حالت: *فقط تحلیل — بدون معامله*\n"
+        f"━━━━━━━━━━━━━━━━━━━━━━"
+    )
+    
+    data = TrueTradeData()
+    all_signals = {}
+    signal_count = 0
+    
+    for symbol in SYMBOLS:
+        try:
+            logger.info(f"[ANALYZE_24H] بررسی {symbol}...")
+            
+            # دریافت داده‌های ۲۴ ساعت اخیر
+            df_1m = data.fetch_ohlcv(symbol, MAIN_TIMEFRAME, 1500)
+            df_5m = data.fetch_ohlcv(symbol, SSL_TIMEFRAME, 300)
+            
+            if df_1m is None or df_1m.empty:
+                logger.warning(f"[ANALYZE_24H] {symbol}: داده 1m نیست")
+                continue
+            
+            # فیلتر ۲۴ ساعت اخیر
+            df_1m = df_1m[df_1m.index >= cutoff_time].copy()
+            
+            if len(df_1m) < 120:
+                logger.warning(f"[ANALYZE_24H] {symbol}: داده ناکافی ({len(df_1m)} کندل)")
+                continue
+            
+            # ایجاد state موقت (جدا از state اصلی)
+            temp_state = SymbolState()
+            
+            # تشخیص سیگنال‌ها (با debug=False برای لاگ کمتر)
+            signals, _ = detect_signal(df_1m, df_5m, temp_state, symbol, debug=False)
+            
+            if signals:
+                all_signals[symbol] = signals
+                signal_count += len(signals)
+                logger.info(f"[ANALYZE_24H] {symbol}: {len(signals)} سیگنال یافت شد")
+                
+                # ارسال هر سیگنال به تلگرام (با برچسب ANALYSIS)
+                for sig in signals:
+                    direction = sig['direction']
+                    dir_emoji = "🟢" if direction == "BUY" else "🔴"
+                    dir_txt = "LONG" if direction == "BUY" else "SHORT"
+                    
+                    msg = (
+                        f"{dir_emoji} *سیگنال تحلیل* — {sig['type']} — `{symbol}` {HASHTAGS['diagnostic']}\n"
+                        f"━━━━━━━━━━━━━━━━━━━━━━\n"
+                        f"🔸 جهت: *{dir_txt}*\n"
+                        f"📝 {sig['extra']}\n"
+                        f"━━━━━━━━━━━━━━━━━━━━━━\n"
+                        f"📍 ورود: `{sig['entry']:.{PRICE_PRECISION.get(symbol, 2)}f}`\n"
+                        f"🛑 حد ضرر: `{sig['stop']:.{PRICE_PRECISION.get(symbol, 2)}f}`\n"
+                        f"🎯 حد سود: `{sig['target']:.{PRICE_PRECISION.get(symbol, 2)}f}`\n"
+                        f"━━━━━━━━━━━━━━━━━━━━━━\n"
+                        f"⚠️ *فقط تحلیل — بدون معامله*\n"
+                        f"🕒 {now_str}"
+                    )
+                    send_telegram_message(msg)
+                    time.sleep(0.5)
+            else:
+                logger.info(f"[ANALYZE_24H] {symbol}: هیچ سیگنالی یافت نشد")
+                
+        except Exception as e:
+            logger.error(f"[ANALYZE_24H] خطا در {symbol}: {e}")
+    
+    # ۲. ذخیره در فایل
+    report_file = f"signals_24h_{now.strftime('%Y%m%d_%H%M%S')}.json"
+    try:
+        with open(report_file, 'w', encoding='utf-8') as f:
+            json.dump({
+                'analysis_time': now_str,
+                'cutoff_time': cutoff_str,
+                'total_signals': signal_count,
+                'signals': all_signals
+            }, f, ensure_ascii=False, indent=2)
+        logger.info(f"[ANALYZE_24H] فایل گزارش ذخیره شد: {report_file}")
+    except Exception as e:
+        logger.error(f"[ANALYZE_24H] خطا در ذخیره فایل: {e}")
+        report_file = None
+    
+    # ۳. ارسال فایل به تلگرام
+    if report_file and os.path.exists(report_file):
+        try:
+            # ارسال فایل به تلگرام
+            url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendDocument"
+            with open(report_file, 'rb') as f:
+                files = {'document': (report_file, f, 'application/json')}
+                data_payload = {'chat_id': TELEGRAM_CHAT_ID}
+                response = requests.post(url, files=files, data=data_payload, timeout=60)
+                
+            if response.status_code == 200:
+                logger.info(f"[ANALYZE_24H] فایل گزارش به تلگرام ارسال شد")
+            else:
+                logger.error(f"[ANALYZE_24H] خطا در ارسال فایل: {response.text[:200]}")
+        except Exception as e:
+            logger.error(f"[ANALYZE_24H] خطا در ارسال فایل به تلگرام: {e}")
+    
+    # ۴. گزارش نهایی
+    summary_msg = (
+        f"✅ *تحلیل ۲۴ ساعت اخیر کامل شد* {HASHTAGS['diagnostic']}\n"
+        f"━━━━━━━━━━━━━━━━━━━━━━\n"
+        f"📊 کل سیگنال‌های یافت شده: *{signal_count}*\n"
+        f"📁 فایل گزارش: `{report_file}`\n"
+        f"━━━━━━━━━━━━━━━━━━━━━━\n"
+        f"⚠️ *هیچ معامله‌ای انجام نشد*\n"
+        f"🕒 {now_str}"
+    )
+    send_telegram_message(summary_msg)
+    
+    logger.info(f"[ANALYZE_24H] تحلیل کامل شد. {signal_count} سیگنال یافت شد.")
+    return all_signals, signal_count
 
 if __name__ == "__main__":
+    logger.info("DTM v6 FC Bot Starting... (نسخه ۴ — Pine-Exact)")
+    
+    # ★ حالت لایو - ریست کامل state (قبل از هر چیز)
     if LIVE_MODE:
         reset_state_for_live_mode()
     
-    logger.info("DTM v6 FC Bot Starting... (LIVE MODE)")
-    logger.info("DTM v6 FC Bot Starting... (نسخه ۴ — Pine-Exact)")
-
+    # بارگذاری state (که الان خالی است)
     load_signal_counter()
     load_states()
 
     hashtag_list = "\n".join([f"• {v} → {k}" for k, v in HASHTAGS.items()])
 
-    # ★ بلوک ۳ — پیام استارتاپ (جایگزین خطوط ~۱۵۶۲ تا ۱۵۷۸)
+    # ★ اجرای تحلیل ۲۴ ساعت اخیر (فقط یک بار - قبل از معاملات اصلی)
+    try:
+        logger.info("[STARTUP] شروع تحلیل ۲۴ ساعت اخیر...")
+        analyze_last_24h_and_send_report()
+        logger.info("[STARTUP] تحلیل ۲۴ ساعت اخیر کامل شد")
+    except Exception as e:
+        logger.error(f"[STARTUP] خطا در تحلیل ۲۴ ساعت: {e}")
+        send_telegram_message(
+            f"⚠️ *خطا در تحلیل ۲۴ ساعت اخیر* {HASHTAGS['diagnostic']}\n"
+            f"━━━━━━━━━━━━━━━━━━━━━━\n"
+            f"📝 {str(e)[:200]}\n"
+            f"🕒 {format_iran_time()}"
+        )
+
+    # ★ بلوک ۳ — پیام استارتاپ
     send_telegram_message(
         f"🤖 *DTM v6·FC — آنلاین* {HASHTAGS['startup']}\n"
         f"━━━━━━━━━━━━━━━━━━━━━━\n"
@@ -1569,6 +1716,11 @@ if __name__ == "__main__":
         f"🕒 {format_iran_time()}"
     )
 
+    # اجرای تشخیص اولیه
     run_startup_diagnostic()
+    
+    # شروع سرور Flask (برای health check)
     threading.Thread(target=lambda: app.run(host="0.0.0.0", port=10000), daemon=True).start()
+    
+    # شروع حلقه اصلی
     main_loop()
