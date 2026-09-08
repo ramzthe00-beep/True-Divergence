@@ -605,23 +605,43 @@ def resolve_bar_from_ts(df_indexed, ts):
 # فیلتر روند SSL Hybrid
 # =====================================================================================
 def compute_ssl_hlv(df_5m):
+    """
+    محاسبه SSL Hybrid با استفاده از PyneCore
+    دقیقاً مطابق با کد Pine Script اصلی
+    """
     if df_5m is None or len(df_5m) < SSL_BASELINE_LEN + 5:
         return 0
-    closed = df_5m.iloc[:-1].reset_index(drop=True)
-    if len(closed) < SSL_BASELINE_LEN + 2:
-        return 0
-    ema_high = calc_hma(closed['high'], SSL_BASELINE_LEN)
-    ema_low = calc_hma(closed['low'], SSL_BASELINE_LEN)
-    close = closed['close']
-    hlv = 0
-    for i in range(len(closed)):
-        if pd.isna(ema_high.iloc[i]) or pd.isna(ema_low.iloc[i]):
-            continue
-        if close.iloc[i] > ema_high.iloc[i]:
-            hlv = 1
-        elif close.iloc[i] < ema_low.iloc[i]:
-            hlv = -1
-    return hlv
+    
+    try:
+        data = {
+            'open': df_5m['open'].values,
+            'high': df_5m['high'].values,
+            'low': df_5m['low'].values,
+            'close': df_5m['close'].values,
+            'volume': df_5m['volume'].values if 'volume' in df_5m else None
+        }
+        
+        result = ssl_hybrid_indicator(data)
+        
+        hlv = result.get('hlv')
+        
+        if hlv is not None and len(hlv) > 0:
+            last_hlv = hlv[-1] if hasattr(hlv, '__getitem__') else hlv
+            if last_hlv == 1:
+                return 1
+            elif last_hlv == -1:
+                return -1
+            else:
+                return 0
+        
+        logger.warning("[SSL] PyneCore returned no valid hlv, using fallback")
+        return compute_ssl_hlv_fallback(df_5m)
+        
+    except Exception as e:
+        logger.error(f"[SSL] Error in PyneCore SSL Hybrid: {e}")
+        return compute_ssl_hlv_fallback(df_5m)
+
+
 
 # =====================================================================================
 # فیبوناچی
