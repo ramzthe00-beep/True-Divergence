@@ -1829,7 +1829,7 @@ def analyze_last_24h_and_send_report():
 
 
 if __name__ == "__main__":
-    global FIRST_RUN
+    #global FIRST_RUN
     
     logger.info("DTM v6 FC Bot Starting... (نسخه ۴ — Pine-Exact)")
     
