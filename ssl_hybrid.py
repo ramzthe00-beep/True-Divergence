@@ -151,7 +151,8 @@ def main(data=None):
         else:
             return ta.wma(source, atrlen)
 
-    atr_slen = ma_function(ta.tr(True), atrlen)
+    # ★ اصلاح: ta.tr(True) → ta.tr(high, low)
+    atr_slen = ma_function(ta.tr(high, low), atrlen)
     upper_band = atr_slen * mult + close
     lower_band = close - atr_slen * mult
 
@@ -186,7 +187,6 @@ def main(data=None):
             c = Series.auto()
             os_ = Series.auto()
             alpha = 2 / (len_ + 1)
-            # ★ عملگر سه‌تایی به فرم پایتون
             a = (z * src + (1 - z) * nz(ts[1], src)) if feedback else src
             b = a if (a > alpha * a + (1 - alpha) * nz(b[1], a)) else (alpha * a + (1 - alpha) * nz(b[1], a))
             c = a if (a < alpha * a + (1 - alpha) * nz(c[1], a)) else (alpha * a + (1 - alpha) * nz(c[1], a))
@@ -255,7 +255,7 @@ def main(data=None):
     # ============================================================
     BBMC = ma(maType, close, len_)
     Keltma = ma(maType, src, len_)
-    rangeValue = ta.tr if useTrueRange else (high - low)
+    rangeValue = ta.tr(high, low) if useTrueRange else (high - low)
     rangema = ta.ema(rangeValue, len_)
     upperk = Keltma + rangema * multy
     lowerk = Keltma - rangema * multy
@@ -327,4 +327,4 @@ def main(data=None):
         'bbmc': BBMC,
         'upperk': upperk,
         'lowerk': lowerk,
-    }
+        }
