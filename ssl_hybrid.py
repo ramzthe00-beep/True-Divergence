@@ -151,8 +151,8 @@ def main(data=None):
         else:
             return ta.wma(source, atrlen)
 
-    # ★ اصلاح: ta.tr(True) → ta.tr(high, low)
-    atr_slen = ma_function(ta.tr(high, low), atrlen)
+    # ★ اصلاح: ta.tr(True) با مقدار 1
+    atr_slen = ma_function(ta.tr(1), atrlen)
     upper_band = atr_slen * mult + close
     lower_band = close - atr_slen * mult
 
@@ -255,7 +255,8 @@ def main(data=None):
     # ============================================================
     BBMC = ma(maType, close, len_)
     Keltma = ma(maType, src, len_)
-    rangeValue = ta.tr(high, low) if useTrueRange else (high - low)
+    # ★ اصلاح: استفاده از ta.tr(1) به جای ta.tr
+    rangeValue = ta.tr(1) if useTrueRange else (high - low)
     rangema = ta.ema(rangeValue, len_)
     upperk = Keltma + rangema * multy
     lowerk = Keltma - rangema * multy
@@ -327,4 +328,4 @@ def main(data=None):
         'bbmc': BBMC,
         'upperk': upperk,
         'lowerk': lowerk,
-        }
+            }
