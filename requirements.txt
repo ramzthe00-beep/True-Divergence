@@ -2,4 +2,5 @@ requests
 numpy
 pandas
 flask
-pynesys-pynecore[cli]
+pynesys-pynecore==6.8.14
+#pynesys-pynecore[cli]
