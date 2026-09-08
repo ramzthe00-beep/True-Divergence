@@ -139,7 +139,7 @@ def main(data=None):
         return ssf
 
     # ============================================================
-    # === ATR CALCULATION ===
+    # === ATR CALCULATION (با محاسبه دستی True Range) ===
     # ============================================================
     def ma_function(source, atrlen):
         if smoothing == "RMA":
@@ -151,8 +151,20 @@ def main(data=None):
         else:
             return ta.wma(source, atrlen)
 
-    # ★ اصلاح: ta.tr(True) با مقدار 1
-    atr_slen = ma_function(ta.tr(1), atrlen)
+    # ★ محاسبه دستی True Range به جای ta.tr()
+    # True Range = max(high - low, abs(high - close[1]), abs(low - close[1]))
+    prev_close = Series.auto()
+    prev_close = close[1]
+    
+    tr1 = high - low
+    tr2 = math.abs(high - prev_close)
+    tr3 = math.abs(low - prev_close)
+    
+    # پیدا کردن最大值 بین سه مقدار
+    true_range = Series.auto()
+    true_range = tr1 if (tr1 >= tr2 and tr1 >= tr3) else (tr2 if (tr2 >= tr3) else tr3)
+    
+    atr_slen = ma_function(true_range, atrlen)
     upper_band = atr_slen * mult + close
     lower_band = close - atr_slen * mult
 
@@ -255,8 +267,8 @@ def main(data=None):
     # ============================================================
     BBMC = ma(maType, close, len_)
     Keltma = ma(maType, src, len_)
-    # ★ اصلاح: استفاده از ta.tr(1) به جای ta.tr
-    rangeValue = ta.tr(1) if useTrueRange else (high - low)
+    # ★ محاسبه دستی True Range برای rangeValue
+    rangeValue = true_range if useTrueRange else (high - low)
     rangema = ta.ema(rangeValue, len_)
     upperk = Keltma + rangema * multy
     lowerk = Keltma - rangema * multy
@@ -328,4 +340,4 @@ def main(data=None):
         'bbmc': BBMC,
         'upperk': upperk,
         'lowerk': lowerk,
-            }
+    }
