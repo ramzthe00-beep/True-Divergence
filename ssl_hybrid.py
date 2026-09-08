@@ -108,10 +108,11 @@ def main():
             c = Series.auto()
             os_ = Series.auto()
             alpha = 2 / (len_ + 1)
-            a = feedback ? z * src + (1 - z) * nz(ts[1], src) : src
-            b = a > alpha * a + (1 - alpha) * nz(b[1], a) ? a : alpha * a + (1 - alpha) * nz(b[1], a)
-            c = a < alpha * a + (1 - alpha) * nz(c[1], a) ? a : alpha * a + (1 - alpha) * nz(c[1], a)
-            os_ = a == b ? 1 : a == c ? 0 : os_[1]
+            # ★ اصلاح شده: عملگر سه‌تایی به فرم پایتون
+            a = (z * src + (1 - z) * nz(ts[1], src)) if feedback else src
+            b = a if (a > alpha * a + (1 - alpha) * nz(b[1], a)) else (alpha * a + (1 - alpha) * nz(b[1], a))
+            c = a if (a < alpha * a + (1 - alpha) * nz(c[1], a)) else (alpha * a + (1 - alpha) * nz(c[1], a))
+            os_ = 1 if (a == b) else (0 if (a == c) else os_[1])
             upper = beta * b + (1 - beta) * c
             lower = beta * c + (1 - beta) * b
             ts = os_ * upper + (1 - os_) * lower
@@ -157,7 +158,7 @@ def main():
             result = delta
         elif type == "McGinley":
             mg = Series.auto()
-            mg = na(mg[1]) ? ta.ema(src, len_) : mg[1] + (src - mg[1]) / (len_ * math.pow(src / mg[1], 4))
+            mg = ta.ema(src, len_) if na(mg[1]) else (mg[1] + (src - mg[1]) / (len_ * math.pow(src / mg[1], 4)))
             result = mg
         elif type == "EDSMA":
             zeros = src - nz(src[2])
@@ -187,31 +188,61 @@ def main():
     atr_slen = ma_function(ta.tr(True), atrlen)
 
     # ============================================================
+    # === RISK CALCULATION ===
+    # ============================================================
+    atr_percentile = ta.percentrank(atr_slen, risk_lookback)
+
+    risk_saturation = 0
+    if not enable_risk_gradient:
+        risk_saturation = 0
+    else:
+        adjusted_percentile = math.pow(atr_percentile / 100, risk_sensitivity) * 100
+        if adjusted_percentile <= 25:
+            risk_saturation = 0
+        elif adjusted_percentile <= 50:
+            risk_saturation = 10
+        else:
+            base_transparency = 25
+            extra_fade = (adjusted_percentile - 50) / 50 * 25
+            risk_saturation = round(base_transparency + extra_fade)
+
+    # ============================================================
+    # === COLOR DEFINITIONS ===
+    # ============================================================
+    bullish_color = color.new(master_bullish_color, risk_saturation)
+    bearish_color = color.new(master_bearish_color, risk_saturation)
+    neutral_color = color.new("#666666", 0)
+    transparent_bull = color.new(master_bullish_color, max(80, risk_saturation + 20))
+    transparent_bear = color.new(master_bearish_color, max(80, risk_saturation + 20))
+    transparent_neutral = color.new("#666666", 80)
+
+    # ============================================================
     # === BASELINE CALCULATIONS ===
     # ============================================================
     BBMC = ma(maType, close, len_)
     Keltma = ma(maType, src, len_)
-    rangeValue = ta.tr if useTrueRange else high - low
+    rangeValue = ta.tr if useTrueRange else (high - low)
     rangema = ta.ema(rangeValue, len_)
     upperk = Keltma + rangema * multy
     lowerk = Keltma - rangema * multy
 
     # ============================================================
-    # === SSL CALCULATIONS (مقدار اصلی که ما نیاز داریم) ===
+    # ★ SSL CALCULATIONS (مقدار اصلی که ما نیاز داریم)
     # ============================================================
     emaHigh = ma(maType, high, len_)
     emaLow = ma(maType, low, len_)
     Hlv = Series.auto()
-    Hlv = 1 if close > emaHigh else (-1 if close < emaLow else Hlv[1])
-    
+    Hlv = 1 if (close > emaHigh) else (-1 if (close < emaLow) else Hlv[1])
+    sslDown = emaHigh if (Hlv < 0) else emaLow
+
     # ============================================================
     # === SSL2 CALCULATIONS ===
     # ============================================================
     maHigh = ma(SSL2Type, high, len2)
     maLow = ma(SSL2Type, low, len2)
     Hlv2 = Series.auto()
-    Hlv2 = 1 if close > maHigh else (-1 if close < maLow else Hlv2[1])
-    sslDown2 = maHigh if Hlv2 < 0 else maLow
+    Hlv2 = 1 if (close > maHigh) else (-1 if (close < maLow) else Hlv2[1])
+    sslDown2 = maHigh if (Hlv2 < 0) else maLow
 
     # ============================================================
     # === EXIT CALCULATIONS ===
@@ -219,8 +250,8 @@ def main():
     ExitHigh = ma(SSL3Type, high, len3)
     ExitLow = ma(SSL3Type, low, len3)
     Hlv3 = Series.auto()
-    Hlv3 = 1 if close > ExitHigh else (-1 if close < ExitLow else Hlv3[1])
-    sslExit = ExitHigh if Hlv3 < 0 else ExitLow
+    Hlv3 = 1 if (close > ExitHigh) else (-1 if (close < ExitLow) else Hlv3[1])
+    sslExit = ExitHigh if (Hlv3 < 0) else ExitLow
 
     # ============================================================
     # === SSL2 Continuation Signals ===
@@ -229,29 +260,26 @@ def main():
     lower_half = close - atr_slen * atr_crit
     buy_inatr = lower_half < sslDown2
     sell_inatr = upper_half > sslDown2
-    sell_cont = close < BBMC and close < sslDown2
-    buy_cont = close > BBMC and close > sslDown2
+    sell_cont = (close < BBMC) and (close < sslDown2)
+    buy_cont = (close > BBMC) and (close > sslDown2)
     sell_atr = sell_inatr and sell_cont
     buy_atr = buy_inatr and buy_cont
 
     # ============================================================
     # ★ مقدار نهایی Hlv که ما در ربات استفاده می‌کنیم
     # ============================================================
-    # hlv_final همان Hlv اصلی است (1, -1 یا 0)
     hlv_final = Hlv
-    
-    # می‌توانیم از Hlv2 هم استفاده کنیم برای ادامه روند
     hlv2_final = Hlv2
 
     # ============================================================
     # ★ برگرداندن مقادیر مورد نیاز برای ربات
     # ============================================================
     return {
-        'hlv': hlv_final,        # مقدار اصلی SSL (1, -1, 0)
-        'hlv2': hlv2_final,      # مقدار SSL2 برای ادامه روند
-        'ssl2_buy': buy_atr,     # سیگنال خرید SSL2
-        'ssl2_sell': sell_atr,   # سیگنال فروش SSL2
-        'bbmc': BBMC,            # خط baseline
-        'upperk': upperk,        # کانال بالایی
-        'lowerk': lowerk,        # کانال پایینی
-  }
+        'hlv': hlv_final,
+        'hlv2': hlv2_final,
+        'ssl2_buy': buy_atr,
+        'ssl2_sell': sell_atr,
+        'bbmc': BBMC,
+        'upperk': upperk,
+        'lowerk': lowerk,
+        }
