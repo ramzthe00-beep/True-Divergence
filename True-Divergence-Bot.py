@@ -21,6 +21,7 @@ DTM v6 FC — Divergence + Golden/Death Cross Signal Bot   (نسخه ۴ — Pine
   • SSL گیت روی همه سیگنال‌ها (واگرایی + تقاطع)
   • div_hist = False برای برابری ۱۰۰٪ با Pine
   • پیام استارتاپ به‌روزرسانی شد
+  • ✅ جلوگیری از ارسال سیگنال‌های گذشته در اولین اجرا
 """
 
 import os
@@ -35,9 +36,6 @@ from datetime import datetime, timezone, timedelta
 from flask import Flask
 import json
 import logging
-# در بالای فایل، بعد از imports دیگر
-import ssl_hybrid
-from ssl_hybrid import main as ssl_hybrid_indicator
 
 logging.basicConfig(
     level=logging.INFO,
@@ -71,9 +69,12 @@ LIVE_MODE = True
 HISTORY_BARS = 300  # فقط ۵ ساعت آخر برای تشخیص سریع
 LOOKBACK_HOURS = 2   # فقط پیوت‌های ۲ ساعت اخیر
 
+# ★ کنترل اولین اجرا - جلوگیری از ارسال سیگنال‌های گذشته
+FIRST_RUN = True
+
 def reset_state_for_live_mode():
     """ریست کامل state برای حالت لایو"""
-    global SYMBOL_STATES, SIGNAL_COUNTER
+    global SYMBOL_STATES, SIGNAL_COUNTER, FIRST_RUN
     
     # ریست state
     SYMBOL_STATES = {s: SymbolState() for s in SYMBOLS}
@@ -86,6 +87,7 @@ def reset_state_for_live_mode():
     
     # ریست شمارنده
     SIGNAL_COUNTER = 0
+    FIRST_RUN = True  # reset first run flag
     logger.info("[LIVE] Mode activated - processing only new data from now on")
   
 # =====================================================================================
@@ -598,60 +600,11 @@ def resolve_bar_from_ts(df_indexed, ts):
     if min_diff <= pd.Timedelta(minutes=3):
         return int(time_diffs.argmin())
     return None
+
 # =====================================================================================
-# ★ فیلتر روند SSL Hybrid — با PyneCore (دقیقاً مثل Pine Script)
+# فیلتر روند SSL Hybrid
 # =====================================================================================
 def compute_ssl_hlv(df_5m):
-    """
-    محاسبه SSL Hybrid با استفاده از PyneCore
-    دقیقاً مطابق با کد Pine Script اصلی
-    """
-    if df_5m is None or len(df_5m) < SSL_BASELINE_LEN + 5:
-        return 0
-    
-    try:
-        # ایجاد DataFrame با ستون‌های مورد نیاز برای PyneCore
-        # PyneCore به داده‌ها به صورت Series نیاز دارد
-        data = {
-            'open': df_5m['open'].values,
-            'high': df_5m['high'].values,
-            'low': df_5m['low'].values,
-            'close': df_5m['close'].values,
-            'volume': df_5m['volume'].values if 'volume' in df_5m else None
-        }
-        
-        # اجرای اندیکاتور SSL Hybrid
-        result = ssl_hybrid_indicator(data)
-        
-        # دریافت مقدار hlv از نتیجه
-        hlv = result.get('hlv')
-        
-        # تبدیل به عدد صحیح
-        if hlv is not None and len(hlv) > 0:
-            # آخرین مقدار معتبر را بگیر
-            last_hlv = hlv[-1] if hasattr(hlv, '__getitem__') else hlv
-            if last_hlv == 1:
-                return 1
-            elif last_hlv == -1:
-                return -1
-            else:
-                return 0
-        
-        # اگر خطایی رخ داد، از روش قبلی استفاده کن (fallback)
-        logger.warning("[SSL] PyneCore failed, using fallback calculation")
-        return compute_ssl_hlv_fallback(df_5m)
-        
-    except Exception as e:
-        logger.error(f"[SSL] Error in PyneCore SSL Hybrid: {e}")
-        # Fallback به روش قبلی
-        return compute_ssl_hlv_fallback(df_5m)
-
-
-# فیلتر SSL
-def compute_ssl_hlv_fallback(df_5m):
-    """
-    روش قبلی محاسبه SSL (به عنوان fallback)
-    """
     if df_5m is None or len(df_5m) < SSL_BASELINE_LEN + 5:
         return 0
     closed = df_5m.iloc[:-1].reset_index(drop=True)
@@ -669,7 +622,6 @@ def compute_ssl_hlv_fallback(df_5m):
         elif close.iloc[i] < ema_low.iloc[i]:
             hlv = -1
     return hlv
-  
 
 # =====================================================================================
 # فیبوناچی
@@ -715,9 +667,7 @@ def check_hammer(df, pivot_bar):
     w_top = row['high'] - max(row['close'], row['open'])
     w_bot = min(row['close'], row['open']) - row['low']
     rng = row['high'] - row['low']
-    return rng > 0 and w_bot >= body * 2.0 and w_bot >= w_top * 2.0 and body < rng * 0.4
-
-# =====================================================================================
+    return rng > 0 and w_bot >= body * 2.0 and w_bot >= w_top * 2.0 and body < rng * 0.4# =====================================================================================
 # Helper: Check bar distance between two pivots
 # =====================================================================================
 def check_bar_distance(bar1, bar2):
@@ -1395,6 +1345,8 @@ def run_startup_diagnostic():
 # تابع اصلی تحلیل + اجرا
 # =====================================================================================
 def analyze_and_execute():
+    global FIRST_RUN
+    
     logger.info("[ANALYZE] شروع...")
     exchange = TrueTradePrivateExchange(API_KEY, API_SECRET, BASE_URL)
     conn = exchange.test_connection()
@@ -1430,7 +1382,48 @@ def analyze_and_execute():
 
             signals, _ = detect_signal(df_1m, df_5m, SYMBOL_STATES[symbol], symbol, debug=True)
 
+            # ★★★ اگر اولین بار اجراست، فقط ۲ سیگنال آخر (جدیدترین) رو بگیر ★★★
+            if FIRST_RUN and len(signals) > 2:
+                logger.info(f"[FIRST_RUN] {symbol}: {len(signals)} سیگنال یافت شد، فقط ۲ تای آخر ارسال می‌شوند")
+                signals = signals[-2:]  # فقط ۲ سیگنال آخر (جدیدترین)
+
+            # ★★★ اگر اولین بار اجراست و سیگنال وجود داره، فقط نمایش بده و معامله نکن ★★★
             for sig in signals:
+                if FIRST_RUN:
+                    # فقط پیام نمایشی بفرست - بدون ثبت در history و بدون معامله
+                    direction = sig['direction']
+                    dir_emoji = "🟢" if direction == "BUY" else "🔴"
+                    dir_txt = "LONG" if direction == "BUY" else "SHORT"
+                    
+                    entry = round_price(sig['entry'], symbol)
+                    stop = round_price(sig['stop'], symbol)
+                    target = round_price(sig['target'], symbol)
+                    
+                    profit_pct = (target-entry)/entry*100 if direction=="BUY" else (entry-target)/entry*100
+                    loss_pct = (entry-stop)/entry*100 if direction=="BUY" else (stop-entry)/entry*100
+                    rr = abs(profit_pct/loss_pct) if loss_pct != 0 else 0
+                    
+                    signal_message = (
+                        f"{dir_emoji} *سیگنال جدید* — {sig['type']} — `{symbol}` {HASHTAGS['signal']}\n"
+                        f"━━━━━━━━━━━━━━━━━━━━━━\n"
+                        f"🔸 جهت: *{dir_txt}*\n"
+                        f"📝 {sig['extra']}\n"
+                        f"━━━━━━━━━━━━━━━━━━━━━━\n"
+                        f"📍 ورود: `{entry:.{PRICE_PRECISION.get(symbol, 2)}f}`\n"
+                        f"🛑 حد ضرر: `{stop:.{PRICE_PRECISION.get(symbol, 2)}f}`\n"
+                        f"🎯 حد سود: `{target:.{PRICE_PRECISION.get(symbol, 2)}f}`\n"
+                        f"━━━━━━━━━━━━━━━━━━━━━━\n"
+                        f"📈 سود احتمالی: +{profit_pct:.2f}%\n"
+                        f"📉 ضرر احتمالی: -{loss_pct:.2f}%\n"
+                        f"⚖️ نسبت ریسک به ریوارد: *1:{rr:.2f}*\n"
+                        f"━━━━━━━━━━━━━━━━━━━━━━\n"
+                        f"⚠️ *حالت اولین اجرا - فقط نمایشی، بدون معامله*\n"
+                        f"🕒 {format_iran_time()}"
+                    )
+                    send_telegram_message(signal_message)
+                    continue  # از این سیگنال صرف نظر کن و معامله نکن
+
+                # ★★★ پردازش عادی سیگنال (برای اجراهای بعدی) ★★★
                 entry = round_price(sig['entry'], symbol)
                 stop = round_price(sig['stop'], symbol)
                 target = round_price(sig['target'], symbol)
@@ -1549,20 +1542,34 @@ def analyze_and_execute():
         except Exception as e:
             logger.error(f"[ERROR] {symbol}: {e}")
 
+    # ★★★ بعد از اولین اجرا، فلگ را False کن ★★★
+    if FIRST_RUN:
+        FIRST_RUN = False
+        logger.info("[FIRST_RUN] حالت اولین اجرا به پایان رسید - ربات وارد حالت عادی می‌شود")
+
     save_states()
 
 # =====================================================================================
 # حلقه اصلی
 # =====================================================================================
 def main_loop():
+    global FIRST_RUN
+    
     exchange = TrueTradePrivateExchange(API_KEY, API_SECRET, BASE_URL)
     last_daily_report_date = None
     last_monthly_report_date = None
 
+    # ★★★ اگر اولین بار است، یک بار Analyze را با FIRST_RUN=True اجرا کن ★★★
+    if FIRST_RUN:
+        logger.info("[MAIN_LOOP] اولین اجرا - پردازش فقط داده‌های جدید")
+        analyze_and_execute()  # اینجا FIRST_RUN=True است و سیگنال‌ها فقط نمایش داده می‌شوند
+        FIRST_RUN = False
+        logger.info("[MAIN_LOOP] اولین اجرا کامل شد - وارد حلقه عادی می‌شویم")
+
     while True:
         try:
             logger.info(f"[LOOP] {format_iran_time()}")
-            analyze_and_execute()
+            analyze_and_execute()  # اینجا FIRST_RUN=False است
 
             today = format_iran_date()
             now = datetime.now(timezone(timedelta(hours=3, minutes=30)))
@@ -1802,6 +1809,8 @@ def analyze_last_24h_and_send_report():
 
 
 if __name__ == "__main__":
+    global FIRST_RUN
+    
     logger.info("DTM v6 FC Bot Starting... (نسخه ۴ — Pine-Exact)")
     
     # ★ حالت لایو - ریست کامل state (قبل از هر چیز)
@@ -1846,6 +1855,9 @@ if __name__ == "__main__":
         f"🕒 {format_iran_time()}"
     )
 
+    # ★ تنظیم FIRST_RUN = True قبل از شروع
+    FIRST_RUN = True
+    
     # اجرای تشخیص اولیه
     run_startup_diagnostic()
     
