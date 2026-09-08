@@ -1538,12 +1538,13 @@ app = Flask(__name__)
 @app.route("/")
 def health():
     return "OK", 200
+
 # =====================================================================================
-# ★ قابلیت جدید: تحلیل ۲۴ ساعت اخیر بدون معامله
+# ★ قابلیت جدید: تحلیل ۲۴ ساعت اخیر بدون معامله (با خروجی TXT)
 # =====================================================================================
 def analyze_last_24h_and_send_report():
     """
-    تحلیل ۲۴ ساعت اخیر، ذخیره سیگنال‌ها در فایل و ارسال به تلگرام
+    تحلیل ۲۴ ساعت اخیر، ذخیره سیگنال‌ها در فایل TXT و ارسال به تلگرام
     فقط یک بار اجرا می‌شود و هیچ معامله‌ای انجام نمی‌دهد
     """
     logger.info("[ANALYZE_24H] شروع تحلیل ۲۴ ساعت اخیر...")
@@ -1624,35 +1625,110 @@ def analyze_last_24h_and_send_report():
         except Exception as e:
             logger.error(f"[ANALYZE_24H] خطا در {symbol}: {e}")
     
-    # ۲. ذخیره در فایل
-    report_file = f"signals_24h_{now.strftime('%Y%m%d_%H%M%S')}.json"
+    # ۲. ذخیره در فایل TXT
+    report_file = f"signals_24h_{now.strftime('%Y%m%d_%H%M%S')}.txt"
     try:
         with open(report_file, 'w', encoding='utf-8') as f:
-            json.dump({
-                'analysis_time': now_str,
-                'cutoff_time': cutoff_str,
-                'total_signals': signal_count,
-                'signals': all_signals
-            }, f, ensure_ascii=False, indent=2)
+            # Header
+            f.write("=" * 80 + "\n")
+            f.write(f"📊 REPORT: 24-HOUR SIGNAL ANALYSIS\n")
+            f.write("=" * 80 + "\n\n")
+            f.write(f"📅 Analysis Time : {now_str}\n")
+            f.write(f"🕐 From          : {cutoff_str}\n")
+            f.write(f"🕐 To            : {now_str}\n")
+            f.write(f"📊 Total Signals : {signal_count}\n")
+            f.write("-" * 80 + "\n\n")
+            
+            if signal_count == 0:
+                f.write("⚠️ هیچ سیگنالی در ۲۴ ساعت اخیر یافت نشد.\n")
+            else:
+                # Signals by symbol
+                for symbol, signals in all_signals.items():
+                    f.write(f"\n{'=' * 80}\n")
+                    f.write(f"🔹 SYMBOL: {symbol}\n")
+                    f.write(f"{'=' * 80}\n")
+                    f.write(f"📊 تعداد سیگنال‌ها: {len(signals)}\n\n")
+                    
+                    for idx, sig in enumerate(signals, 1):
+                        direction = sig['direction']
+                        dir_txt = "LONG" if direction == "BUY" else "SHORT"
+                        dir_emoji = "🟢" if direction == "BUY" else "🔴"
+                        
+                        # محاسبه سود/ضرر
+                        entry = sig['entry']
+                        stop = sig['stop']
+                        target = sig['target']
+                        if direction == "BUY":
+                            profit_pct = (target - entry) / entry * 100
+                            loss_pct = (entry - stop) / entry * 100
+                        else:
+                            profit_pct = (entry - target) / entry * 100
+                            loss_pct = (stop - entry) / entry * 100
+                        rr = profit_pct / loss_pct if loss_pct != 0 else 0
+                        
+                        f.write(f"┌─ سیگنال #{idx} ─────────────────────────────\n")
+                        f.write(f"│ {dir_emoji} نوع: {sig['type']}\n")
+                        f.write(f"│ 📊 جهت: {dir_txt}\n")
+                        f.write(f"│ 📝 توضیحات: {sig['extra']}\n")
+                        f.write(f"│ ──────────────────────────────────────────\n")
+                        f.write(f"│ 📍 ورود     : {entry:.{PRICE_PRECISION.get(symbol, 2)}f}\n")
+                        f.write(f"│ 🛑 حد ضرر   : {stop:.{PRICE_PRECISION.get(symbol, 2)}f}\n")
+                        f.write(f"│ 🎯 حد سود   : {target:.{PRICE_PRECISION.get(symbol, 2)}f}\n")
+                        f.write(f"│ ──────────────────────────────────────────\n")
+                        f.write(f"│ 📈 سود احتمالی : +{profit_pct:.2f}%\n")
+                        f.write(f"│ 📉 ضرر احتمالی : -{loss_pct:.2f}%\n")
+                        f.write(f"│ ⚖️ نسبت RR     : 1:{rr:.2f}\n")
+                        f.write(f"└──────────────────────────────────────────\n\n")
+            
+            # Footer
+            f.write("-" * 80 + "\n")
+            f.write(f"⚠️ این گزارش صرفاً جهت تحلیل است و هیچ معامله‌ای انجام نشده است.\n")
+            f.write(f"🕒 {now_str}\n")
+            f.write("=" * 80 + "\n")
+            
         logger.info(f"[ANALYZE_24H] فایل گزارش ذخیره شد: {report_file}")
     except Exception as e:
         logger.error(f"[ANALYZE_24H] خطا در ذخیره فایل: {e}")
         report_file = None
     
-    # ۳. ارسال فایل به تلگرام
+    # ۳. ارسال فایل TXT به تلگرام
     if report_file and os.path.exists(report_file):
         try:
             # ارسال فایل به تلگرام
             url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendDocument"
             with open(report_file, 'rb') as f:
-                files = {'document': (report_file, f, 'application/json')}
-                data_payload = {'chat_id': TELEGRAM_CHAT_ID}
+                files = {'document': (report_file, f, 'text/plain')}
+                data_payload = {
+                    'chat_id': TELEGRAM_CHAT_ID,
+                    'caption': f"📊 گزارش تحلیل ۲۴ ساعت اخیر\n📅 {now_str}\n📊 {signal_count} سیگنال یافت شد"
+                }
                 response = requests.post(url, files=files, data=data_payload, timeout=60)
                 
             if response.status_code == 200:
                 logger.info(f"[ANALYZE_24H] فایل گزارش به تلگرام ارسال شد")
             else:
                 logger.error(f"[ANALYZE_24H] خطا در ارسال فایل: {response.text[:200]}")
+                # اگر فایل ارسال نشد، محتوا را به صورت متن ارسال کن
+                try:
+                    with open(report_file, 'r', encoding='utf-8') as f:
+                        content = f.read()
+                    if len(content) > 4000:
+                        parts = [content[i:i+4000] for i in range(0, len(content), 4000)]
+                        for i, part in enumerate(parts):
+                            send_telegram_message(
+                                f"📄 *گزارش تحلیل (بخش {i+1}/{len(parts)})*\n"
+                                f"━━━━━━━━━━━━━━━━━━━━━━\n"
+                                f"```\n{part}\n```"
+                            )
+                    else:
+                        send_telegram_message(
+                            f"📄 *گزارش تحلیل ۲۴ ساعت اخیر*\n"
+                            f"━━━━━━━━━━━━━━━━━━━━━━\n"
+                            f"```\n{content}\n```"
+                        )
+                except Exception as e2:
+                    logger.error(f"[ANALYZE_24H] خطا در ارسال متن: {e2}")
+                    
         except Exception as e:
             logger.error(f"[ANALYZE_24H] خطا در ارسال فایل به تلگرام: {e}")
     
@@ -1670,6 +1746,7 @@ def analyze_last_24h_and_send_report():
     
     logger.info(f"[ANALYZE_24H] تحلیل کامل شد. {signal_count} سیگنال یافت شد.")
     return all_signals, signal_count
+
 
 if __name__ == "__main__":
     logger.info("DTM v6 FC Bot Starting... (نسخه ۴ — Pine-Exact)")
