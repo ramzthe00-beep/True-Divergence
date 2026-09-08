@@ -35,6 +35,9 @@ from datetime import datetime, timezone, timedelta
 from flask import Flask
 import json
 import logging
+# در بالای فایل، بعد از imports دیگر
+import ssl_hybrid
+from ssl_hybrid import main as ssl_hybrid_indicator
 
 logging.basicConfig(
     level=logging.INFO,
@@ -595,11 +598,60 @@ def resolve_bar_from_ts(df_indexed, ts):
     if min_diff <= pd.Timedelta(minutes=3):
         return int(time_diffs.argmin())
     return None
-
 # =====================================================================================
-# فیلتر روند SSL Hybrid
+# ★ فیلتر روند SSL Hybrid — با PyneCore (دقیقاً مثل Pine Script)
 # =====================================================================================
 def compute_ssl_hlv(df_5m):
+    """
+    محاسبه SSL Hybrid با استفاده از PyneCore
+    دقیقاً مطابق با کد Pine Script اصلی
+    """
+    if df_5m is None or len(df_5m) < SSL_BASELINE_LEN + 5:
+        return 0
+    
+    try:
+        # ایجاد DataFrame با ستون‌های مورد نیاز برای PyneCore
+        # PyneCore به داده‌ها به صورت Series نیاز دارد
+        data = {
+            'open': df_5m['open'].values,
+            'high': df_5m['high'].values,
+            'low': df_5m['low'].values,
+            'close': df_5m['close'].values,
+            'volume': df_5m['volume'].values if 'volume' in df_5m else None
+        }
+        
+        # اجرای اندیکاتور SSL Hybrid
+        result = ssl_hybrid_indicator(data)
+        
+        # دریافت مقدار hlv از نتیجه
+        hlv = result.get('hlv')
+        
+        # تبدیل به عدد صحیح
+        if hlv is not None and len(hlv) > 0:
+            # آخرین مقدار معتبر را بگیر
+            last_hlv = hlv[-1] if hasattr(hlv, '__getitem__') else hlv
+            if last_hlv == 1:
+                return 1
+            elif last_hlv == -1:
+                return -1
+            else:
+                return 0
+        
+        # اگر خطایی رخ داد، از روش قبلی استفاده کن (fallback)
+        logger.warning("[SSL] PyneCore failed, using fallback calculation")
+        return compute_ssl_hlv_fallback(df_5m)
+        
+    except Exception as e:
+        logger.error(f"[SSL] Error in PyneCore SSL Hybrid: {e}")
+        # Fallback به روش قبلی
+        return compute_ssl_hlv_fallback(df_5m)
+
+
+# فیلتر SSL
+def compute_ssl_hlv_fallback(df_5m):
+    """
+    روش قبلی محاسبه SSL (به عنوان fallback)
+    """
     if df_5m is None or len(df_5m) < SSL_BASELINE_LEN + 5:
         return 0
     closed = df_5m.iloc[:-1].reset_index(drop=True)
@@ -617,6 +669,7 @@ def compute_ssl_hlv(df_5m):
         elif close.iloc[i] < ema_low.iloc[i]:
             hlv = -1
     return hlv
+  
 
 # =====================================================================================
 # فیبوناچی
