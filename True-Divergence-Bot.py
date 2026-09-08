@@ -61,6 +61,30 @@ if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
 HISTORY_FILE = "trades_history_dtm_v6.json"
 STATE_FILE = "pivot_state_dtm_v6.json"
 
+# ═══════════════════════════════════════════════════════════════
+# ★ LIVE MODE — فقط معاملات جدید از لحظه اجرا
+# ═══════════════════════════════════════════════════════════════
+LIVE_MODE = True
+HISTORY_BARS = 300  # فقط ۵ ساعت آخر برای تشخیص سریع
+LOOKBACK_HOURS = 2   # فقط پیوت‌های ۲ ساعت اخیر
+
+def reset_state_for_live_mode():
+    """ریست کامل state برای حالت لایو"""
+    global SYMBOL_STATES, SIGNAL_COUNTER
+    
+    # ریست state
+    SYMBOL_STATES = {s: SymbolState() for s in SYMBOLS}
+    
+    # حذف فایل‌های قدیمی
+    for f in [STATE_FILE, HISTORY_FILE]:
+        if os.path.exists(f):
+            os.remove(f)
+            logger.info(f"[LIVE] Removed old file: {f}")
+    
+    # ریست شمارنده
+    SIGNAL_COUNTER = 0
+    logger.info("[LIVE] Mode activated - processing only new data from now on")
+  
 # =====================================================================================
 # هشتگ‌ها
 # =====================================================================================
@@ -1516,6 +1540,10 @@ def health():
     return "OK", 200
 
 if __name__ == "__main__":
+    if LIVE_MODE:
+        reset_state_for_live_mode()
+    
+    logger.info("DTM v6 FC Bot Starting... (LIVE MODE)")
     logger.info("DTM v6 FC Bot Starting... (نسخه ۴ — Pine-Exact)")
 
     load_signal_counter()
