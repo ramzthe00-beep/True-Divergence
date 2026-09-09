@@ -1939,29 +1939,11 @@ def analyze_last_24h_and_send_report():
                 all_signals[symbol] = signals
                 signal_count += len(signals)
                 logger.info(f"[ANALYZE_24H] {symbol}: {len(signals)} سیگنال یافت شد")
-                
-                # ارسال هر سیگنال به تلگرام (با برچسب ANALYSIS)
-                for sig in signals:
-                    direction = sig['direction']
-                    dir_emoji = "🟢" if direction == "BUY" else "🔴"
-                    dir_txt = "LONG" if direction == "BUY" else "SHORT"
-                    
-                    msg = (
-                        f"{dir_emoji} *سیگنال تحلیل* — {sig['type']} — `{symbol}` {HASHTAGS['diagnostic']}\n"
-                        f"━━━━━━━━━━━━━━━━━━━━━━\n"
-                        f"🔸 جهت: *{dir_txt}*\n"
-                        f"📝 {sig['extra']}\n"
-                        f"🕐 زمان دقیق سیگنال: `{sig.get('time', '—')}`\n"
-                        f"━━━━━━━━━━━━━━━━━━━━━━\n"
-                        f"📍 ورود: `{sig['entry']:.{PRICE_PRECISION.get(symbol, 2)}f}`\n"
-                        f"🛑 حد ضرر: `{sig['stop']:.{PRICE_PRECISION.get(symbol, 2)}f}`\n"
-                        f"🎯 حد سود: `{sig['target']:.{PRICE_PRECISION.get(symbol, 2)}f}`\n"
-                        f"━━━━━━━━━━━━━━━━━━━━━━\n"
-                        f"⚠️ *فقط تحلیل — بدون معامله*\n"
-                        f"🕒 گزارش تهیه‌شده در: {now_str}"
-                    )
-                    send_telegram_message(msg)
-                    time.sleep(0.5)
+                # ★★★ رفع اسپم: دیگر برای هر سیگنال پیام جدا به تلگرام ارسال نمی‌شود ★★★
+                # (باگ اصلی که واگرایی صفر تولید می‌کرد رفع شده، پس روی ۲۴ ساعت کامل
+                #  با تایم‌فریم ۱ دقیقه‌ای، ده‌ها/صدها پیوت معتبر پیدا می‌شود — ارسال
+                #  پیام جداگانه برای هرکدام غیرعملی است. جزئیات کامل هر سیگنال در همان
+                #  فایل TXK زیر ذخیره و به‌صورت یک فایل واحد به تلگرام ارسال می‌شود.)
             else:
                 logger.info(f"[ANALYZE_24H] {symbol}: هیچ سیگنالی یافت نشد")
                 
