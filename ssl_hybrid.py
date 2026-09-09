@@ -1,343 +1,444 @@
+# -*- coding: utf-8 -*-
 """
-SSL Hybrid — نسخه ۱۰۰٪ مطابق با Pine Script اصلی (Mihkel00)
-@pyne
+SSL Hybrid — بازنویسی کامل بدون وابستگی به PyneCore (Mihkel00 Pine Script, ۱۰۰٪ منطبق)
+====================================================================================
+چرا این نسخه جایگزین نسخه‌ی PyneCore شد؟
+--------------------------------------------------------------------
+نسخه‌ی قبلی از `pynecore` استفاده می‌کرد، اما دو مشکل ساختاری داشت که باعث خطای
+دائمی می‌شد:
+
+1) در PyneCore، ورودی‌ها (input.*) باید به‌صورت **مقدار پیش‌فرض پارامترهای تابع
+   main** تعریف شوند، نه با فراخوانی داخل بدنه‌ی تابع. کد قبلی همه‌ی input()ها را
+   داخل بدنه فراخوانی می‌کرد که با معماری واقعی PyneCore (AST transform روی
+   امضای تابع) سازگار نیست.
+2) مهم‌تر از آن: در فایل `True-Divergence-Bot.py`، این اندیکاتور این‌طور صدا زده
+   می‌شود:
+
+       result = ssl_hybrid_indicator(data)   # data = دیکشنری آرایه‌های numpy
+
+   یعنی به یک **تابع معمولی پایتون** نیاز دارید که یک دیکشنری OHLCV بگیرد و یک
+   دیکشنری آرایه برگرداند. اما یک اسکریپت `@script.indicator` در PyneCore اصلاً
+   این‌طور اجرا نمی‌شود — باید از طریق runtime خودِ PyneCore (`pyne run ...`)
+   بار به بار اجرا شود و `close/high/low` را از globals خودش می‌گیرد، نه از
+   آرگومان `data` (که در فایل قبلی اصلاً استفاده نمی‌شد!). به همین دلیل بات همیشه
+   خطا می‌گرفت.
+
+راه‌حل: کل منطق Pine Script با pandas/numpy به‌صورت برداری (و برای بخش‌های
+بازگشتی مثل JMA/MF/McGinley/EDSMA با یک حلقه‌ی سبک) پیاده‌سازی شده — بدون هیچ
+وابستگی خارجی جز pandas و numpy. خروجی این تابع دقیقاً همان کلیدهایی است که
+`compute_ssl_hlv()` در بات انتظار دارد.
+
+فقط MA هایی که خواسته بودید (JMA, VAMA, Kijun v2, EDSMA) به‌همراه بقیه‌ی انواع
+موجود در اسکریپت اصلی (SMA, EMA, DEMA, TEMA, LSMA, WMA, MF, TMA, HMA, McGinley)
+پیاده‌سازی شده‌اند — یعنی از تمام گزینه‌های Baseline Type / SSL2 Type / Exit Type
+می‌توانید استفاده کنید.
 """
-from pynecore import Series
-from pynecore.lib import (
-    script, close, high, low, open, input, ta, plot, color, 
-    math, nz, na
-)
+from __future__ import annotations
 
-@script.indicator("SSL Hybrid", overlay=True)
-def main(data=None):
-    # ============================================================
-    # === DISPLAY CONTROLS ===
-    # ============================================================
-    display_mode = input.string(
-        "Full Display", title="Display Mode",
-        options=["Baseline Only", "Baseline + SSL", "SSL Only", "Entry/Exit Only", "Full Display"]
-    )
-    color_bars = input.bool(True, title="Color Bars")
-    show_signals = input.bool(True, title="Show Signal Diamonds")
-    show_risk_table = input.bool(True, title="Show Risk Table")
+import numpy as np
+import pandas as pd
 
-    # ============================================================
-    # === MASTER COLOR SETTINGS ===
-    # ============================================================
-    master_bullish_color = input.color("#00c3ff", title="Bullish Color")
-    master_bearish_color = input.color("#ff0062", title="Bearish Color")
+__all__ = ["main", "ssl_hybrid"]
 
-    # ============================================================
-    # === BASELINE SETTINGS ===
-    # ============================================================
-    maType = input.string(
-        "HMA", title="Baseline Type",
-        options=["SMA", "EMA", "DEMA", "TEMA", "LSMA", "WMA", "MF", "VAMA", "TMA", "HMA", "JMA", "Kijun v2", "EDSMA", "McGinley"]
-    )
-    len_ = input.int(60, title="Baseline Length")
-    src = input(close, title="Source")
-    show_baseline_channel = input.bool(True, title="Show Baseline Channel")
-    multy = input.float(0.2, step=0.05, title="Channel Multiplier")
-    useTrueRange = input.bool(True, title="Use True Range for Channel")
 
-    # ============================================================
-    # === SSL SETTINGS ===
-    # ============================================================
-    SSL2Type = input.string(
-        "JMA", title="SSL2 Type",
-        options=["SMA", "EMA", "DEMA", "TEMA", "WMA", "MF", "VAMA", "TMA", "HMA", "JMA", "McGinley"]
-    )
-    len2 = input.int(5, title="SSL2 Length")
-    atr_crit = input.float(0.9, step=0.1, title="Continuation ATR Criteria")
+# ============================================================
+# === ابزارهای پایه (برداری) ===
+# ============================================================
+def _sma(s: pd.Series, n: int) -> pd.Series:
+    n = max(1, int(round(n)))
+    return s.rolling(n, min_periods=1).mean()
 
-    # ============================================================
-    # === EXIT SETTINGS ===
-    # ============================================================
-    SSL3Type = input.string(
-        "HMA", title="Exit Type",
-        options=["DEMA", "TEMA", "LSMA", "VAMA", "TMA", "HMA", "JMA", "Kijun v2", "McGinley", "MF"]
-    )
-    len3 = input.int(15, title="Exit Length")
 
-    # ============================================================
-    # === ATR SETTINGS ===
-    # ============================================================
-    atrlen = input.int(14, title="ATR Period")
-    mult = input.float(1.0, title="ATR Multiplier", step=0.1)
-    smoothing = input.string("WMA", title="ATR Smoothing", options=["RMA", "SMA", "EMA", "WMA"])
-    show_atr_bands = input.bool(False, title="Show ATR Bands")
+def _ema(s: pd.Series, n: int) -> pd.Series:
+    n = max(1, int(round(n)))
+    return s.ewm(span=n, adjust=False, min_periods=1).mean()
 
-    # ============================================================
-    # === RISK ASSESSMENT ===
-    # ============================================================
-    risk_lookback = input.int(100, title="Risk Lookback Period", minval=50, maxval=500)
-    risk_sensitivity = input.float(2, title="Risk Sensitivity", minval=0.2, maxval=3.0, step=0.1)
-    enable_risk_gradient = input.bool(True, title="Enable Risk Gradient")
 
-    # ============================================================
-    # === JURIK (JMA) SETTINGS ===
-    # ============================================================
-    jurik_phase = input.int(3, title="Phase")
-    jurik_power = input.int(1, title="Power")
+def _rma(s: pd.Series, n: int) -> pd.Series:
+    n = max(1, int(round(n)))
+    return s.ewm(alpha=1.0 / n, adjust=False, min_periods=1).mean()
 
-    # ============================================================
-    # === KIJUN SETTINGS ===
-    # ============================================================
-    kidiv = input.int(1, maxval=4, title="Kijun MOD Divider")
 
-    # ============================================================
-    # === VAMA SETTINGS ===
-    # ============================================================
-    volatility_lookback = input.int(10, title="Volatility Lookback Length")
+def _wma(s: pd.Series, n) -> pd.Series:
+    n = max(1, int(round(n)))
+    w = np.arange(1, n + 1, dtype=float)
+    w_sum = w.sum()
 
-    # ============================================================
-    # === MODULAR FILTER SETTINGS ===
-    # ============================================================
-    beta = input.float(0.8, minval=0, maxval=1, step=0.1, title="Beta")
-    feedback = input.bool(False, title="Feedback")
-    z = input.float(0.5, title="Feedback Weighting", step=0.1, minval=0, maxval=1)
+    def f(x):
+        wi = w[-len(x):]
+        return float(np.dot(x, wi) / wi.sum()) if len(x) else np.nan
 
-    # ============================================================
-    # === EDSMA SETTINGS ===
-    # ============================================================
-    ssfLength = input.int(20, title="Super Smoother Filter Length", minval=1)
-    ssfPoles = input.int(2, title="Super Smoother Filter Poles", options=[2, 3])
+    return s.rolling(n, min_periods=1).apply(f, raw=True)
 
-    # ============================================================
-    # === MOVING AVERAGE FUNCTIONS ===
-    # ============================================================
-    def tema(src, len_):
-        ema1 = ta.ema(src, len_)
-        ema2 = ta.ema(ema1, len_)
-        ema3 = ta.ema(ema2, len_)
-        return (3 * ema1) - (3 * ema2) + ema3
 
-    def get2PoleSSF(src, length):
-        PI = 2 * math.asin(1)
-        arg = math.sqrt(2) * PI / length
-        a1 = math.exp(-arg)
-        b1 = 2 * a1 * math.cos(arg)
-        c2 = b1
-        c3 = -math.pow(a1, 2)
-        c1 = 1 - c2 - c3
-        ssf = Series.auto()
-        ssf = c1 * src + c2 * nz(ssf[1]) + c3 * nz(ssf[2])
-        return ssf
+def _stdev(s: pd.Series, n: int) -> pd.Series:
+    n = max(1, int(round(n)))
+    return s.rolling(n, min_periods=1).std(ddof=0).fillna(0.0)
 
-    def get3PoleSSF(src, length):
-        PI = 2 * math.asin(1)
-        arg = PI / length
-        a1 = math.exp(-arg)
-        b1 = 2 * a1 * math.cos(1.738 * arg)
-        c1 = math.pow(a1, 2)
-        coef2 = b1 + c1
-        coef3 = -(c1 + b1 * c1)
-        coef4 = math.pow(c1, 2)
-        coef1 = 1 - coef2 - coef3 - coef4
-        ssf = Series.auto()
-        ssf = coef1 * src + coef2 * nz(ssf[1]) + coef3 * nz(ssf[2]) + coef4 * nz(ssf[3])
-        return ssf
 
-    # ============================================================
-    # === ATR CALCULATION (با محاسبه دستی True Range) ===
-    # ============================================================
-    def ma_function(source, atrlen):
-        if smoothing == "RMA":
-            return ta.rma(source, atrlen)
-        elif smoothing == "SMA":
-            return ta.sma(source, atrlen)
-        elif smoothing == "EMA":
-            return ta.ema(source, atrlen)
+def _highest(s: pd.Series, n) -> pd.Series:
+    n = max(1, int(round(n)))
+    return s.rolling(n, min_periods=1).max()
+
+
+def _lowest(s: pd.Series, n) -> pd.Series:
+    n = max(1, int(round(n)))
+    return s.rolling(n, min_periods=1).min()
+
+
+def _linreg(s: pd.Series, n: int, offset: int = 0) -> pd.Series:
+    """معادل ta.linreg(src, length, offset) در Pine."""
+    n = max(2, int(round(n)))
+    xi = np.arange(n, dtype=float)
+
+    def f(x):
+        y = x
+        if len(y) < 2:
+            return y[-1]
+        xx = xi[-len(y):]
+        slope, intercept = np.polyfit(xx, y, 1)
+        return intercept + slope * (xx[-1] - offset)
+
+    return s.rolling(n, min_periods=1).apply(f, raw=True)
+
+
+def _percentrank(s: pd.Series, n: int) -> pd.Series:
+    """معادل ta.percentrank: درصد مقادیرِ n میله‌ی قبلی که کمتر از مقدار جاری هستند."""
+    n = max(1, int(round(n)))
+
+    def f(x):
+        if len(x) < 2:
+            return 0.0
+        cur = x[-1]
+        past = x[:-1]
+        return float(np.sum(past < cur) / len(past) * 100.0)
+
+    return s.rolling(n + 1, min_periods=1).apply(f, raw=True).fillna(0.0)
+
+
+def _true_range(high: pd.Series, low: pd.Series, close: pd.Series) -> pd.Series:
+    prev_close = close.shift(1)
+    tr = pd.concat(
+        [
+            (high - low).abs(),
+            (high - prev_close).abs(),
+            (low - prev_close).abs(),
+        ],
+        axis=1,
+    ).max(axis=1)
+    tr.iloc[0] = (high.iloc[0] - low.iloc[0])
+    return tr
+
+
+# ============================================================
+# === MAهای بازگشتی (نیاز به حلقه‌ی بار-به-بار) ===
+# ============================================================
+def _jma(src: pd.Series, length: float, phase: float = 3, power: float = 1) -> pd.Series:
+    x = src.to_numpy(dtype=float)
+    n = len(x)
+    out = np.zeros(n)
+    e0 = 0.0
+    e1 = 0.0
+    e2 = 0.0
+    jma_prev = 0.0
+    length = max(1e-6, float(length))
+    phase_ratio = phase / 100.0 + 1.5
+    beta = 0.45 * (length - 1) / (0.45 * (length - 1) + 2)
+    alpha = beta ** power
+    for i in range(n):
+        e0 = (1 - alpha) * x[i] + alpha * e0
+        e1 = (x[i] - e0) * (1 - beta) + beta * e1
+        e2 = (e0 + phase_ratio * e1 - jma_prev) * (1 - alpha) ** 2 + (alpha ** 2) * e2
+        jma_prev = e2 + jma_prev
+        out[i] = jma_prev
+    return pd.Series(out, index=src.index)
+
+
+def _mcginley(src: pd.Series, length: float) -> pd.Series:
+    x = src.to_numpy(dtype=float)
+    n = len(x)
+    out = np.empty(n)
+    mg = np.nan
+    length = max(1e-6, float(length))
+    for i in range(n):
+        if np.isnan(mg):
+            mg = x[i]  # معادل ta.ema(src,len) در همان بار اول (که na است)
         else:
-            return ta.wma(source, atrlen)
+            ratio = x[i] / mg if mg != 0 else 1.0
+            mg = mg + (x[i] - mg) / (length * (ratio ** 4 if ratio > 0 else 1.0))
+        out[i] = mg
+    return pd.Series(out, index=src.index)
 
-    # ★ محاسبه دستی True Range به جای ta.tr()
-    # True Range = max(high - low, abs(high - close[1]), abs(low - close[1]))
-    prev_close = Series.auto()
-    prev_close = close[1]
-    
-    tr1 = high - low
-    tr2 = math.abs(high - prev_close)
-    tr3 = math.abs(low - prev_close)
-    
-    # پیدا کردن最大值 بین سه مقدار
-    true_range = Series.auto()
-    true_range = tr1 if (tr1 >= tr2 and tr1 >= tr3) else (tr2 if (tr2 >= tr3) else tr3)
-    
-    atr_slen = ma_function(true_range, atrlen)
+
+def _modular_filter(src: pd.Series, length: float, beta_: float, feedback: bool, z: float) -> pd.Series:
+    x = src.to_numpy(dtype=float)
+    n = len(x)
+    out = np.empty(n)
+    ts = 0.0
+    b = 0.0
+    c = 0.0
+    os_ = 0.0
+    alpha = 2.0 / (length + 1)
+    for i in range(n):
+        a = (z * x[i] + (1 - z) * (ts if i > 0 else x[i])) if feedback else x[i]
+        prev_b = b if i > 0 else a
+        prev_c = c if i > 0 else a
+        b = a if a > alpha * a + (1 - alpha) * prev_b else alpha * a + (1 - alpha) * prev_b
+        c = a if a < alpha * a + (1 - alpha) * prev_c else alpha * a + (1 - alpha) * prev_c
+        if a == b:
+            os_ = 1
+        elif a == c:
+            os_ = 0
+        # else: os_ keeps previous value
+        upper = beta_ * b + (1 - beta_) * c
+        lower = beta_ * c + (1 - beta_) * b
+        ts = os_ * upper + (1 - os_) * lower
+        out[i] = ts
+    return pd.Series(out, index=src.index)
+
+
+def _ssf(src: pd.Series, length: float, poles: int) -> pd.Series:
+    x = src.to_numpy(dtype=float)
+    n = len(x)
+    out = np.zeros(n)
+    length = max(1e-6, float(length))
+    if poles == 2:
+        pi = 2 * np.arcsin(1.0)
+        arg = np.sqrt(2) * pi / length
+        a1 = np.exp(-arg)
+        b1 = 2 * a1 * np.cos(arg)
+        c2, c3 = b1, -(a1 ** 2)
+        c1 = 1 - c2 - c3
+        p1 = p2 = 0.0
+        for i in range(n):
+            v = c1 * x[i] + c2 * p1 + c3 * p2
+            out[i] = v
+            p2, p1 = p1, v
+    else:
+        pi = 2 * np.arcsin(1.0)
+        arg = pi / length
+        a1 = np.exp(-arg)
+        b1 = 2 * a1 * np.cos(1.738 * arg)
+        c1_ = a1 ** 2
+        coef2 = b1 + c1_
+        coef3 = -(c1_ + b1 * c1_)
+        coef4 = c1_ ** 2
+        coef1 = 1 - coef2 - coef3 - coef4
+        p1 = p2 = p3 = 0.0
+        for i in range(n):
+            v = coef1 * x[i] + coef2 * p1 + coef3 * p2 + coef4 * p3
+            out[i] = v
+            p3, p2, p1 = p2, p1, v
+    return pd.Series(out, index=src.index)
+
+
+def _edsma(src: pd.Series, length: float, ssf_length: float, ssf_poles: int) -> pd.Series:
+    zeros = src - src.shift(2).fillna(src.iloc[0])
+    avg_zeros = ((zeros + zeros.shift(1).fillna(zeros.iloc[0])) / 2)
+    ssf = _ssf(avg_zeros, ssf_length, ssf_poles)
+    stdev = _stdev(ssf, length)
+    scaled = np.where(stdev.to_numpy() != 0, ssf.to_numpy() / stdev.to_numpy().clip(min=1e-12), 0.0)
+    alpha_arr = np.clip(5 * np.abs(scaled) / max(1e-6, length), 0.0, 1.0)
+
+    x = src.to_numpy(dtype=float)
+    n = len(x)
+    out = np.empty(n)
+    prev = 0.0
+    for i in range(n):
+        prev = alpha_arr[i] * x[i] + (1 - alpha_arr[i]) * prev
+        out[i] = prev
+    return pd.Series(out, index=src.index)
+
+
+# ============================================================
+# === توزیع‌کننده‌ی نوع MA (معادل تابع ma() در Pine) ===
+# ============================================================
+def _ma(ma_type: str, src: pd.Series, length, *, high: pd.Series = None, low: pd.Series = None,
+        jurik_phase=3, jurik_power=1, kidiv=1, volatility_lookback=10,
+        beta=0.8, feedback=False, z=0.5, ssfLength=20, ssfPoles=2) -> pd.Series:
+    n = max(1, length)
+    if ma_type == "SMA":
+        return _sma(src, n)
+    if ma_type == "EMA":
+        return _ema(src, n)
+    if ma_type == "WMA":
+        return _wma(src, n)
+    if ma_type == "DEMA":
+        e = _ema(src, n)
+        return 2 * e - _ema(e, n)
+    if ma_type == "TEMA":
+        e1 = _ema(src, n)
+        e2 = _ema(e1, n)
+        e3 = _ema(e2, n)
+        return 3 * e1 - 3 * e2 + e3
+    if ma_type == "LSMA":
+        return _linreg(src, n, 0)
+    if ma_type == "TMA":
+        return _sma(_sma(src, int(np.ceil(n / 2))), int(np.floor(n / 2)) + 1)
+    if ma_type == "HMA":
+        return _wma(2 * _wma(src, n / 2) - _wma(src, n), int(round(np.sqrt(n))))
+    if ma_type == "VAMA":
+        mid = _ema(src, n)
+        dev = src - mid
+        vol_up = _highest(dev, volatility_lookback)
+        vol_down = _lowest(dev, volatility_lookback)
+        return mid + (vol_up + vol_down) / 2.0
+    if ma_type == "JMA":
+        return _jma(src, n, jurik_phase, jurik_power)
+    if ma_type == "McGinley":
+        return _mcginley(src, n)
+    if ma_type == "MF":
+        return _modular_filter(src, n, beta, feedback, z)
+    if ma_type == "EDSMA":
+        return _edsma(src, n, ssfLength, ssfPoles)
+    if ma_type == "Kijun v2":
+        hi = high if high is not None else src
+        lo = low if low is not None else src
+        kijun = (_lowest(lo, n) + _highest(hi, n)) / 2.0
+        conv_len = max(1, n / max(1, kidiv))
+        conversion = (_lowest(lo, conv_len) + _highest(hi, conv_len)) / 2.0
+        return (kijun + conversion) / 2.0
+    raise ValueError(f"Unknown MA type: {ma_type}")
+
+
+def _hold_state(cond_up: pd.Series, cond_down: pd.Series) -> pd.Series:
+    """معادل الگوی Pine: val := up ? 1 : down ? -1 : val[1]  (مقدار قبلی حفظ می‌شود تا شرط جدید برقرار شود)."""
+    raw = pd.Series(np.where(cond_up, 1, np.where(cond_down, -1, np.nan)), index=cond_up.index)
+    return raw.ffill().fillna(0).astype(int)
+
+
+# ============================================================
+# === تابع اصلی — همان چیزی که True-Divergence-Bot صدا می‌زند ===
+# ============================================================
+def main(
+    data: dict,
+    *,
+    maType: str = "HMA", len_: int = 60,
+    SSL2Type: str = "JMA", len2: int = 5, atr_crit: float = 0.9,
+    SSL3Type: str = "HMA", len3: int = 15,
+    atrlen: int = 14, mult: float = 1.0, smoothing: str = "WMA",
+    multy: float = 0.2, useTrueRange: bool = True,
+    risk_lookback: int = 100, risk_sensitivity: float = 2.0,
+    enable_risk_gradient: bool = True,
+    jurik_phase: int = 3, jurik_power: int = 1,
+    kidiv: int = 1, volatility_lookback: int = 10,
+    beta: float = 0.8, feedback: bool = False, z: float = 0.5,
+    ssfLength: int = 20, ssfPoles: int = 2,
+) -> dict:
+    """
+    ورودی `data`: دیکشنری با کلیدهای 'open','high','low','close' (numpy array یا list)
+    خروجی: دیکشنری آرایه‌های numpy — دقیقاً هم‌طول با ورودی — با کلیدهای:
+        hlv, hlv2, hlv3, ssl2_buy, ssl2_sell, bbmc, upperk, lowerk,
+        sslDown, sslDown2, sslExit, atr, risk_level, entry_distance
+    """
+    if data is None:
+        raise ValueError("ssl_hybrid.main: 'data' نمی‌تواند None باشد")
+
+    close = pd.Series(np.asarray(data["close"], dtype=float))
+    high = pd.Series(np.asarray(data["high"], dtype=float))
+    low = pd.Series(np.asarray(data["low"], dtype=float))
+    open_ = pd.Series(np.asarray(data.get("open", data["close"]), dtype=float))
+    src = close  # ورودی "Source" در Pine پیش‌فرض close است
+
+    ma_kwargs = dict(
+        jurik_phase=jurik_phase, jurik_power=jurik_power, kidiv=kidiv,
+        volatility_lookback=volatility_lookback, beta=beta, feedback=feedback, z=z,
+        ssfLength=ssfLength, ssfPoles=ssfPoles,
+    )
+
+    # --- True Range / ATR ---
+    tr = _true_range(high, low, close)
+    smoothing_fn = {"RMA": _rma, "SMA": _sma, "EMA": _ema, "WMA": _wma}.get(smoothing, _wma)
+    atr_slen = smoothing_fn(tr, atrlen)
     upper_band = atr_slen * mult + close
     lower_band = close - atr_slen * mult
 
-    # ============================================================
-    # === RISK CALCULATION ===
-    # ============================================================
-    atr_percentile = ta.percentrank(atr_slen, risk_lookback)
+    # --- Risk ---
+    atr_percentile = _percentrank(atr_slen, risk_lookback)
+    risk_level = pd.Series(
+        np.where(atr_percentile > 75, "High", np.where(atr_percentile < 25, "Low", "Normal")),
+        index=close.index,
+    )
 
-    if not enable_risk_gradient:
-        risk_saturation = 0
-    else:
-        adjusted_percentile = math.pow(atr_percentile / 100, risk_sensitivity) * 100
-        if adjusted_percentile <= 25:
-            risk_saturation = 0
-        elif adjusted_percentile <= 50:
-            risk_saturation = 10
-        else:
-            base_transparency = 25
-            extra_fade = (adjusted_percentile - 50) / 50 * 25
-            risk_saturation = int(base_transparency + extra_fade)
-
-    # ============================================================
-    # === MOVING AVERAGE FUNCTIONS ===
-    # ============================================================
-    def ma(type, src, len_):
-        result = Series.auto()
-        if type == "TMA":
-            result = ta.sma(ta.sma(src, math.ceil(len_ / 2)), math.floor(len_ / 2) + 1)
-        elif type == "MF":
-            ts = Series.auto()
-            b = Series.auto()
-            c = Series.auto()
-            os_ = Series.auto()
-            alpha = 2 / (len_ + 1)
-            a = (z * src + (1 - z) * nz(ts[1], src)) if feedback else src
-            b = a if (a > alpha * a + (1 - alpha) * nz(b[1], a)) else (alpha * a + (1 - alpha) * nz(b[1], a))
-            c = a if (a < alpha * a + (1 - alpha) * nz(c[1], a)) else (alpha * a + (1 - alpha) * nz(c[1], a))
-            os_ = 1 if (a == b) else (0 if (a == c) else os_[1])
-            upper = beta * b + (1 - beta) * c
-            lower = beta * c + (1 - beta) * b
-            ts = os_ * upper + (1 - os_) * lower
-            result = ts
-        elif type == "LSMA":
-            result = ta.linreg(src, len_, 0)
-        elif type == "SMA":
-            result = ta.sma(src, len_)
-        elif type == "EMA":
-            result = ta.ema(src, len_)
-        elif type == "DEMA":
-            e = ta.ema(src, len_)
-            result = 2 * e - ta.ema(e, len_)
-        elif type == "TEMA":
-            result = tema(src, len_)
-        elif type == "WMA":
-            result = ta.wma(src, len_)
-        elif type == "VAMA":
-            mid = ta.ema(src, len_)
-            dev = src - mid
-            vol_up = ta.highest(dev, volatility_lookback)
-            vol_down = ta.lowest(dev, volatility_lookback)
-            result = mid + math.avg(vol_up, vol_down)
-        elif type == "HMA":
-            result = ta.wma(2 * ta.wma(src, len_ / 2) - ta.wma(src, len_), math.round(math.sqrt(len_)))
-        elif type == "JMA":
-            phaseRatio = jurik_phase / 100 + 1.5
-            beta_ = 0.45 * (len_ - 1) / (0.45 * (len_ - 1) + 2)
-            alpha = math.pow(beta_, jurik_power)
-            jma = Series.auto()
-            e0 = Series.auto()
-            e0 = (1 - alpha) * src + alpha * nz(e0[1])
-            e1 = Series.auto()
-            e1 = (src - e0) * (1 - beta_) + beta_ * nz(e1[1])
-            e2 = Series.auto()
-            e2 = (e0 + phaseRatio * e1 - nz(jma[1])) * math.pow(1 - alpha, 2) + math.pow(alpha, 2) * nz(e2[1])
-            jma = e2 + nz(jma[1])
-            result = jma
-        elif type == "Kijun v2":
-            kijun = math.avg(ta.lowest(len_), ta.highest(len_))
-            conversionLine = math.avg(ta.lowest(len_ / kidiv), ta.highest(len_ / kidiv))
-            delta = (kijun + conversionLine) / 2
-            result = delta
-        elif type == "McGinley":
-            mg = Series.auto()
-            mg = ta.ema(src, len_) if na(mg[1]) else (mg[1] + (src - mg[1]) / (len_ * math.pow(src / mg[1], 4)))
-            result = mg
-        elif type == "EDSMA":
-            zeros = src - nz(src[2])
-            avgZeros = (zeros + zeros[1]) / 2
-            ssf = get2PoleSSF(avgZeros, ssfLength) if ssfPoles == 2 else get3PoleSSF(avgZeros, ssfLength)
-            stdev = ta.stdev(ssf, len_)
-            scaledFilter = ssf / stdev if stdev != 0 else 0
-            alpha = 5 * math.abs(scaledFilter) / len_
-            edsma = Series.auto()
-            edsma = alpha * src + (1 - alpha) * nz(edsma[1])
-            result = edsma
-        return result
-
-    # ============================================================
-    # === BASELINE CALCULATIONS ===
-    # ============================================================
-    BBMC = ma(maType, close, len_)
-    Keltma = ma(maType, src, len_)
-    # ★ محاسبه دستی True Range برای rangeValue
-    rangeValue = true_range if useTrueRange else (high - low)
-    rangema = ta.ema(rangeValue, len_)
+    # --- Baseline ---
+    BBMC = _ma(maType, close, len_, high=high, low=low, **ma_kwargs)
+    Keltma = _ma(maType, src, len_, high=high, low=low, **ma_kwargs)
+    rangeValue = tr if useTrueRange else (high - low)
+    rangema = _ema(rangeValue, len_)
     upperk = Keltma + rangema * multy
     lowerk = Keltma - rangema * multy
 
-    # ============================================================
-    # === SSL CALCULATIONS ===
-    # ============================================================
-    emaHigh = ma(maType, high, len_)
-    emaLow = ma(maType, low, len_)
-    Hlv = Series.auto()
-    Hlv = 1 if (close > emaHigh) else (-1 if (close < emaLow) else Hlv[1])
-    sslDown = emaHigh if (Hlv < 0) else emaLow
+    # --- SSL1 (Baseline MA type) ---
+    emaHigh = _ma(maType, high, len_, high=high, low=low, **ma_kwargs)
+    emaLow = _ma(maType, low, len_, high=high, low=low, **ma_kwargs)
+    Hlv = _hold_state(close > emaHigh, close < emaLow)
+    sslDown = pd.Series(np.where(Hlv < 0, emaHigh, emaLow), index=close.index)
 
-    # ============================================================
-    # === SSL2 VALUES ===
-    # ============================================================
-    maHigh = ma(SSL2Type, high, len2)
-    maLow = ma(SSL2Type, low, len2)
-    Hlv2 = Series.auto()
-    Hlv2 = 1 if (close > maHigh) else (-1 if (close < maLow) else Hlv2[1])
-    sslDown2 = maHigh if (Hlv2 < 0) else maLow
+    # --- SSL2 ---
+    maHigh = _ma(SSL2Type, high, len2, high=high, low=low, **ma_kwargs)
+    maLow = _ma(SSL2Type, low, len2, high=high, low=low, **ma_kwargs)
+    Hlv2 = _hold_state(close > maHigh, close < maLow)
+    sslDown2 = pd.Series(np.where(Hlv2 < 0, maHigh, maLow), index=close.index)
 
-    # ============================================================
-    # === EXIT VALUES ===
-    # ============================================================
-    ExitHigh = ma(SSL3Type, high, len3)
-    ExitLow = ma(SSL3Type, low, len3)
-    Hlv3 = Series.auto()
-    Hlv3 = 1 if (close > ExitHigh) else (-1 if (close < ExitLow) else Hlv3[1])
-    sslExit = ExitHigh if (Hlv3 < 0) else ExitLow
+    # --- Exit ---
+    ExitHigh = _ma(SSL3Type, high, len3, high=high, low=low, **ma_kwargs)
+    ExitLow = _ma(SSL3Type, low, len3, high=high, low=low, **ma_kwargs)
+    Hlv3 = _hold_state(close > ExitHigh, close < ExitLow)
+    sslExit = pd.Series(np.where(Hlv3 < 0, ExitHigh, ExitLow), index=close.index)
 
-    # ============================================================
-    # === ENTRY DISTANCE CALCULATION ===
-    # ============================================================
-    distance_from_baseline = math.abs(close - BBMC) / atr_slen
-    entry_distance = "Near" if (distance_from_baseline < 1) else ("Extended" if (distance_from_baseline < 2) else "Far")
+    # --- Entry distance ---
+    dist = (close - BBMC).abs() / atr_slen.replace(0, np.nan)
+    entry_distance = pd.Series(
+        np.where(dist < 1, "Near", np.where(dist < 2, "Extended", "Far")), index=close.index
+    )
 
-    # ============================================================
-    # === RISK LEVEL ===
-    # ============================================================
-    risk_level = "High" if (atr_percentile > 75) else ("Low" if (atr_percentile < 25) else "Normal")
-
-    # ============================================================
-    # === SSL2 Continuation ===
-    # ============================================================
+    # --- SSL2 Continuation ---
     upper_half = atr_slen * atr_crit + close
     lower_half = close - atr_slen * atr_crit
     buy_inatr = lower_half < sslDown2
     sell_inatr = upper_half > sslDown2
-    sell_cont = (close < BBMC) and (close < sslDown2)
-    buy_cont = (close > BBMC) and (close > sslDown2)
-    sell_atr = sell_inatr and sell_cont
-    buy_atr = buy_inatr and buy_cont
+    sell_cont = (close < BBMC) & (close < sslDown2)
+    buy_cont = (close > BBMC) & (close > sslDown2)
+    sell_atr = (sell_inatr & sell_cont)
+    buy_atr = (buy_inatr & buy_cont)
 
-    # ============================================================
-    # ★ مقدار نهایی Hlv که ما در ربات استفاده می‌کنیم
-    # ============================================================
-    hlv_final = Hlv
-    hlv2_final = Hlv2
-
-    # ============================================================
-    # ★ برگرداندن مقادیر مورد نیاز برای ربات
-    # ============================================================
     return {
-        'hlv': hlv_final,
-        'hlv2': hlv2_final,
-        'ssl2_buy': buy_atr,
-        'ssl2_sell': sell_atr,
-        'bbmc': BBMC,
-        'upperk': upperk,
-        'lowerk': lowerk,
+        "hlv": Hlv.to_numpy(),
+        "hlv2": Hlv2.to_numpy(),
+        "hlv3": Hlv3.to_numpy(),
+        "ssl2_buy": buy_atr.to_numpy(),
+        "ssl2_sell": sell_atr.to_numpy(),
+        "bbmc": BBMC.to_numpy(),
+        "upperk": upperk.to_numpy(),
+        "lowerk": lowerk.to_numpy(),
+        "sslDown": sslDown.to_numpy(),
+        "sslDown2": sslDown2.to_numpy(),
+        "sslExit": sslExit.to_numpy(),
+        "atr": atr_slen.to_numpy(),
+        "atr_percentile": atr_percentile.to_numpy(),
+        "risk_level": risk_level.to_numpy(),
+        "entry_distance": entry_distance.to_numpy(),
     }
+
+
+# نام جایگزین راحت برای استفاده‌ی مستقیم به‌جای main()
+ssl_hybrid = main
+
+
+if __name__ == "__main__":
+    # تست خودکار کوچک با داده‌ی تصادفی — فقط برای اطمینان از عدم بروز خطا
+    rng = np.random.default_rng(42)
+    n = 400
+    close_ = 100 + np.cumsum(rng.normal(0, 1, n))
+    high_ = close_ + rng.uniform(0, 1, n)
+    low_ = close_ - rng.uniform(0, 1, n)
+    open_ = close_ + rng.normal(0, 0.3, n)
+    data = {"open": open_, "high": high_, "low": low_, "close": close_}
+
+    for ma_type in ["SMA", "EMA", "DEMA", "TEMA", "LSMA", "WMA", "MF", "VAMA", "TMA",
+                     "HMA", "JMA", "Kijun v2", "EDSMA", "McGinley"]:
+        r = main(data, maType=ma_type)
+        assert len(r["hlv"]) == n, ma_type
+        print(f"{ma_type:10s} OK  last hlv={r['hlv'][-1]}  bbmc={r['bbmc'][-1]:.3f}")
+
+    print("\nAll MA types executed without error.")
