@@ -1,12 +1,32 @@
 # -*- coding: utf-8 -*-
 """
-DTM v6 FC — Divergence + Golden/Death Cross Signal Bot   (نسخه ۵ — Binance + TrueTrade SL/TP)
+DTM v6 FC — Divergence + Golden/Death Cross Signal Bot   (نسخه ۴ — Pine-Exact)
 ====================================================================
-+ دریافت داده از **بایننس** (جایگزین دِتروترید)
-+ تبدیل داده‌ها به فرمت OHLCV (مطابق strategy_wrapper)
-+ محاسبه استاپ/تارگت با منطق دقیق strategy_wrapper (R:R >= 2)
-+ ریسک‌فری روی سطح ساختاری (structural_level)
-====================================================================
++ تمام امکانات نسخه ۳ (Fixes, reporting, state persistence, risk-free, ...)
++ **Pine-Exact**: RIGHT_BARS = 1 (i_pr=1)
++ **Pine-Exact**: دو پیوت متوالی (نه چندگانه)
++ **Pine-Exact**: MIN_CLASSIC_SCORE = 1 (هر واگرایی با ستاره = سیگنال)
++ **Pine-Exact**: SSL گیت روی همه سیگنال‌ها (تک‌تایم‌فریمی 5m)
++ **Pine-Exact**: برابری ۱۰۰٪ با منطق Pine (div_hist = False)
++ **Fixed**: resolve_bar_from_ts slice bug
++ **ENHANCED**: Multi-Pivot Comparison for 1m timeframe
+  (compare new pivot with multiple previous pivots, min/max bar distance filters)
++ **DEBUG**: Full Debug Log in file
++ **FIX (این نسخه)**: تقاطع طلایی/مرگ دیگر روی داده‌های قدیمی (Catch-up بعد از
+  ری‌استارت/گپ) معامله نمی‌کند — فقط تقاطعِ واقعاً تازه (چند کندل آخر) سیگنال/معامله
+  می‌شود؛ گیت SSL هم دقیقاً در همان لحظه‌ی تقاطع خوانده می‌شود — همان لحظه‌ای که
+  پاین برچسب را روی چارت رسم می‌کند.
+------------------------------------------------------------------
+🆕 تغییرات نسخه ۴ (به درخواست کاربر):
+  • RIGHT_BARS = 1 (i_pr=1) — مطابق Pine
+  • MIN_CLASSIC_SCORE = 1 — هر واگرایی با یک ستاره = سیگنال
+  • مقایسه فقط با دو پیوت متوالی (Pine-exact)
+  • حذف MAX_HISTORICAL_PIVOTS و فاصله‌ی کندلی از منطق واگرایی
+  • SSL گیت روی همه سیگنال‌ها (واگرایی + تقاطع)
+  • div_hist = False برای برابری ۱۰۰٪ با Pine
+  • پیام استارتاپ به‌روزرسانی شد
+  • ✅ جلوگیری از ارسال سیگنال‌های گذشته در اولین اجرا
+  • ✅ SSL Hybrid با لاگ تخصصی و ارسال به تلگرام
 """
 
 import os
@@ -22,7 +42,6 @@ from flask import Flask
 import json
 import logging
 import traceback
-import math as _math
 
 logging.basicConfig(
     level=logging.INFO,
@@ -32,17 +51,17 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # ============================================
-# ★★★ API Configuration — بایننس ★★★
+# API Configuration — فقط از متغیر محیطی
 # ============================================
-API_KEY = os.getenv("BINANCE_API_KEY")
-API_SECRET = os.getenv("BINANCE_API_SECRET")
-BASE_URL = "https://fapi.binance.com"  # فیوچرز
+API_KEY = os.getenv("API_KEY")
+API_SECRET = os.getenv("API_SECRET")
+BASE_URL = os.getenv("BASE_URL", "https://apiv2.thetruetrade.io")
 
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 
 if not API_KEY or not API_SECRET:
-    raise RuntimeError("BINANCE_API_KEY / BINANCE_API_SECRET باید به‌عنوان متغیر محیطی ست شوند.")
+    raise RuntimeError("API_KEY / API_SECRET باید به‌عنوان متغیر محیطی ست شوند.")
 if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
     raise RuntimeError("TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID باید به‌عنوان متغیر محیطی ست شوند.")
 
@@ -73,21 +92,29 @@ except Exception as e:
     logger.error(f"[SSL] ❌ Error loading ssl_hybrid.py: {e}")
 
 # ═══════════════════════════════════════════════════════════════
-# ★ LIVE MODE
+# ★ LIVE MODE — فقط معاملات جدید از لحظه اجرا
 # ═══════════════════════════════════════════════════════════════
 LIVE_MODE = True
-HISTORY_BARS = 300
-LOOKBACK_HOURS = 2
+HISTORY_BARS = 300  # فقط ۵ ساعت آخر برای تشخیص سریع
+LOOKBACK_HOURS = 2   # فقط پیوت‌های ۲ ساعت اخیر
 
+# ★ کنترل اولین اجرا - جلوگیری از ارسال سیگنال‌های گذشته
 FIRST_RUN = True
 
 def reset_state_for_live_mode():
+    """ریست کامل state برای حالت لایو"""
     global SYMBOL_STATES, SIGNAL_COUNTER, FIRST_RUN
+    
+    # ریست state
     SYMBOL_STATES = {s: SymbolState() for s in SYMBOLS}
+    
+    # حذف فایل‌های قدیمی
     for f in [STATE_FILE, HISTORY_FILE]:
         if os.path.exists(f):
             os.remove(f)
             logger.info(f"[LIVE] Removed old file: {f}")
+    
+    # ریست شمارنده
     SIGNAL_COUNTER = 0
     FIRST_RUN = True
     logger.info("[LIVE] Mode activated - processing only new data from now on")
@@ -116,31 +143,10 @@ HASHTAGS = {
 }
 
 # =====================================================================================
-# ★★★ TICK_SIZES / PRICE_PRECISION — از strategy_wrapper (22).py ★★★
-# =====================================================================================
-SYMBOL_TICK_INFO = {
-    "LTCUSDT":  {"mintick": 0.01,    "pricescale": 100,    "basecurrency": "LTC"},
-    "DOGEUSDT": {"mintick": 0.00001, "pricescale": 100000, "basecurrency": "DOGE"},
-    "ETHUSDT":  {"mintick": 0.01,    "pricescale": 100,    "basecurrency": "ETH"},
-    "BNBUSDT":  {"mintick": 0.01,    "pricescale": 100,    "basecurrency": "BNB"},
-}
-
-TICK_SIZES = {sym: info["mintick"] for sym, info in SYMBOL_TICK_INFO.items()}
-PRICE_PRECISION = {
-    "LTCUSDT": 2,
-    "DOGEUSDT": 5,
-    "ETHUSDT": 2,
-    "BNBUSDT": 2,
-}
-LEVERAGE_MAP = {"LTCUSDT": 75, "DOGEUSDT": 75, "ETHUSDT": 50, "BNBUSDT": 50}
-TARGET_RISK_USDT = 3.5
-SYMBOLS = ["LTCUSDT", "DOGEUSDT", "ETHUSDT", "BNBUSDT"]
-
-# =====================================================================================
-# ★★★ بلوک ۱ — ثابت‌ها (Pine-Exact) ★★★
+# ★ بلوک ۱ — ثابت‌ها (جایگزین خطوط ~۸۸ تا ۱۳۵)
 # =====================================================================================
 LEFT_BARS = 5
-RIGHT_BARS = 2
+RIGHT_BARS = 2                # ✅ باید دقیقاً برابر «پیوت راست» (i_pr) در ورودی‌های اندیکاتور پاین باشد
 
 RSI_LEN = 14
 MACD_FAST, MACD_SLOW, MACD_SIGNAL = 12, 26, 9
@@ -151,216 +157,100 @@ ATR_LEN = 14
 MA_FAST_LEN, MA_MID_LEN, MA_SLOW_LEN = 7, 25, 99
 
 FIB_TOLERANCE_PCT = 1.5
-MIN_CLASSIC_SCORE = 1
+MIN_CLASSIC_SCORE = 1           # ★ هر واگرایی با ستاره = سیگنال (مطابق برچسب Pine)
 
+# ★★★ تصمیم نهایی کاربر: سیگنال پایتون = دقیقاً لحظه‌ی ظهور برچسب روی چارت پاین ★★★
+# برچسب در پاین (بخش ⑳) بلافاصله با تشکیل پیوت + trending + حداقل یک شرط
+# واگرایی ظاهر می‌شود و اصلاً منتظر کندل تأییدیه (Hammer/Shooting Star) نمی‌ماند
+# — i_req_pa_conf فقط روی «ورود واقعی استراتژی» اثر دارد، نه روی خودِ برچسب.
+# بنابراین اینجا خاموش است تا لحظه‌ی سیگنال پایتون = لحظه‌ی ظهور برچسب باشد.
+# (منطق و کد صف تأییدیه برای احتمال تغییر تصمیم در آینده حذف نشده، فقط غیرفعال است)
 REQUIRE_PA_CONFIRMATION = False
 WAIT_BARS_PA_CONFIRM = 3
 
+# ★★★ گیت SSL روی خودِ برچسب هم اجباری است (طبق تأیید صریح کاربر) ★★★
+# در پاین این معادل تیک‌خورده بودن i_lbl_gate است — یعنی برچسب هم فقط
+# هم‌جهت با گیت SSL (gate_long/gate_short) ظاهر می‌شود، نه بدون قید‌وشرط.
 APPLY_SSL_GATE_ON_LABELS = True
 
-# ★★★ استاپ/تارگت — عیناً از strategy_wrapper (22).py ★★★
-STOP_ATR_BUFFER = 0.1
-TARGET_RR = 2.0  # حداقل R:R = 2 (مطابق strategy_wrapper)
+STOP_ATR_BUFFER = 0.1           # فقط برای تقاطع طلایی/مرگ
+TARGET_RR = 3.0                 # ⚖️ ریسک به ریوارد = ۳
 
-SSL_TIMEFRAME = "5m"
+STOP_BUFFER_TICKS = 5           # چند سنت ایمنی بیرون از دو پیوت
+
+SSL_TIMEFRAME = "5m"            # ✅ تک‌تایم‌فریمی — فقط ۵ دقیقه
 SSL_BASELINE_LEN = 34
 MAIN_TIMEFRAME = "1m"
 
 CROSS_ATR_STOP_MULT = 2.0
 
+# ★★★ FIX #1 — جلوگیری از معامله روی تقاطع‌های طلایی/مرگِ قدیمی ★★★
+# اگر بعد از ری‌استارت/گپ در داده/خالی بودن state، مجبور به Catch-up (پردازش
+# بازه‌ی بزرگی از کندل‌های گذشته) شویم، هر تقاطعی که در آن بازه پیدا شود
+# «به لحاظ ریاضی» درست است، اما دیگر واقعاً «تازه» نیست و نباید معامله شود.
+# این ثابت مشخص می‌کند که فقط تقاطع‌های واقع در همین چند کندل آخر (نزدیک به
+# لحظه‌ی اجرای فعلی ربات) به‌عنوان سیگنال/معامله در نظر گرفته شوند؛ تقاطع‌های
+# قدیمی‌تر فقط برای صحتِ داخلیِ وضعیت رست (rst_l/rst_s) پردازش می‌شوند و هیچ
+# سیگنال/معامله‌ای از آن‌ها صادر نمی‌شود.
 MAX_CROSS_EMIT_LOOKBACK_BARS = 2
+
+TICK_SIZES = {"LTCUSDT": 0.01, "DOGEUSDT": 0.00001, "ETHUSDT": 0.01}
+PRICE_PRECISION = {"LTCUSDT": 2, "DOGEUSDT": 5, "ETHUSDT": 2}
+LEVERAGE_MAP = {"LTCUSDT": 75, "DOGEUSDT": 75, "ETHUSDT": 50}
+TARGET_RISK_USDT = 3.5
+
+SYMBOLS = ["LTCUSDT", "DOGEUSDT", "ETHUSDT"]
 
 HISTORY_BARS = 5000
 API_RETURNS_OPEN_CANDLE = False
 
-APPLY_SSL_GATE = True
-SSL_SINGLE_TF = True
+# ═══════════════════════════════════════════════════════════════
+# ★ Pine-Parity نهایی (نسخه ۴)
+# ═══════════════════════════════════════════════════════════════
+APPLY_SSL_GATE = True           # ✅ i_lbl_gate=true → برچسب‌ها فقط با تأیید SSL
+SSL_SINGLE_TF = True            # ✅ «فقط تایم فریم ۱» → فقط 5m
 
+# (دیگر استفاده نمی‌شوند — مقایسه فقط بین دو پیوت متوالی مثل Pine)
 MAX_HISTORICAL_PIVOTS = 20
 MIN_BARS_BETWEEN_PIVOTS = 5
 MAX_BARS_BETWEEN_PIVOTS = 80
 
 # =====================================================================================
-# ★★★ کلاس OHLCV (برای تطبیق با strategy_wrapper) ★★★
+# کلاس دریافت داده
 # =====================================================================================
-class OHLCV:
-    def __init__(self, timestamp, open, high, low, close, volume=0, is_closed=True):
-        self.timestamp = timestamp
-        self.open = float(open)
-        self.high = float(high)
-        self.low = float(low)
-        self.close = float(close)
-        self.volume = float(volume)
-        self.is_closed = is_closed
-
-# =====================================================================================
-# ★★★ تابع محاسبه استاپ/تارگت — عیناً از strategy_wrapper (22).py ★★★
-# =====================================================================================
-def _valid_num(x):
-    return x is not None and not (isinstance(x, float) and x != x)
-
-def _is_na(x):
-    return x is None or (isinstance(x, float) and _math.isnan(x))
-
-def compute_stop_target_from_wrapper(candles, signal, last_values, mintick, buffer_ticks=2):
-    """
-    ★★★ عیناً از strategy_wrapper (22).py کپی شده ★★★
-    
-    استاپ/تارگت سفارشی — کاملاً مستقل از منطق واگرایی strategy.py.
-    
-    LONG:  استاپ = پایین‌ترین دره از ۲ دره واگرایی - بافر
-           تارگت خام = بالاترین قله بین آن دو دره
-           اگر R:R < 2 → تارگت بالا برده می‌شود تا R:R = 2
-    
-    SHORT: استاپ = بالاترین قله از ۲ قله واگرایی + بافر
-           تارگت خام = پایین‌ترین دره بین آن دو قله
-           اگر R:R < 2 → تارگت پایین برده می‌شود تا R:R = 2
-
-    خروجی چهارم (structural_level):
-        LONG → بالاترین قلهٔ بین دو دره | SHORT → پایین‌ترین درهٔ بین دو قله
-        (فقط برای محاسبهٔ نقطهٔ ریسک فری استفاده می‌شود)
-    """
-    def _valid(x):
-        return x is not None and not (isinstance(x, float) and _math.isnan(x))
-
-    entry = last_values.get("entry")
-    if not _valid(entry):
-        return None, None, None, None
-
-    buffer_abs = buffer_ticks * mintick
-
-    if signal == "LONG":
-        low1 = last_values.get("previous_pivot_low_price")
-        low2 = last_values.get("pivot_low_price")
-        bar1 = last_values.get("previous_pivot_low_index")
-        bar2 = last_values.get("pivot_low_index")
-        
-        if not (_valid(low1) and _valid(low2) and _valid(bar1) and _valid(bar2)):
-            logger.warning(f"[SL/TP] LONG: missing pivot data low1={low1} low2={low2} bar1={bar1} bar2={bar2}")
-            return None, None, None, None
-
-        stop = min(low1, low2) - buffer_abs
-
-        lo, hi = sorted((int(bar1), int(bar2)))
-        lo, hi = max(lo, 0), min(hi, len(candles) - 1)
-        if hi < lo:
-            return None, None, None, None
-        
-        # پیدا کردن بالاترین قله بین دو دره
-        mid_peak = max(c.high for c in candles[lo:hi + 1])
-
-        risk = entry - stop
-        if risk <= 0:
-            return None, None, None, None
-
-        rr = (mid_peak - entry) / risk
-        target = mid_peak if rr >= 2 else entry + 2 * risk
-        return stop, target, max(rr, 2.0), mid_peak
-
-    elif signal == "SHORT":
-        high1 = last_values.get("previous_pivot_high_price")
-        high2 = last_values.get("pivot_high_price")
-        bar1 = last_values.get("previous_pivot_high_index")
-        bar2 = last_values.get("pivot_high_index")
-        
-        if not (_valid(high1) and _valid(high2) and _valid(bar1) and _valid(bar2)):
-            logger.warning(f"[SL/TP] SHORT: missing pivot data high1={high1} high2={high2} bar1={bar1} bar2={bar2}")
-            return None, None, None, None
-
-        stop = max(high1, high2) + buffer_abs
-
-        lo, hi = sorted((int(bar1), int(bar2)))
-        lo, hi = max(lo, 0), min(hi, len(candles) - 1)
-        if hi < lo:
-            return None, None, None, None
-        
-        # پیدا کردن پایین‌ترین دره بین دو قله
-        mid_trough = min(c.low for c in candles[lo:hi + 1])
-
-        risk = stop - entry
-        if risk <= 0:
-            return None, None, None, None
-
-        rr = (entry - mid_trough) / risk
-        target = mid_trough if rr >= 2 else entry - 2 * risk
-        return stop, target, max(rr, 2.0), mid_trough
-
-    return None, None, None, None
-
-def compute_risk_free_pct(entry, stop_price, structural_level, signal):
-    """
-    ★★★ محاسبه نقطه ریسک‌فری — عیناً از strategy_wrapper ★★★
-    """
-    if structural_level is None or stop_price is None or not _valid_num(entry) or entry <= 0:
-        return None
-    
-    risk_abs = abs(entry - stop_price)
-    risk_pct = risk_abs / entry
-    
-    if signal == "LONG":
-        struct_pct = (structural_level - entry) / entry
-        return max(struct_pct, risk_pct)
-    else:  # SHORT
-        struct_pct = (entry - structural_level) / entry
-        return -max(struct_pct, risk_pct)
-
-# =====================================================================================
-# ★★★ کلاس دریافت داده از بایننس ★★★
-# =====================================================================================
-class BinanceData:
+class TrueTradeData:
     def __init__(self):
         self.base_url = BASE_URL
 
     def fetch_ohlcv(self, symbol, timeframe='1m', limit=HISTORY_BARS):
-        """دریافت کندل از بایننس فیوچرز و تبدیل به لیست OHLCV (مطابق strategy_wrapper)"""
         symbol_clean = symbol.upper()
-        resolution_map = {"1m": "1m", "5m": "5m", "15m": "15m", "30m": "30m", "1h": "1h", "4h": "4h"}
-        interval = resolution_map.get(timeframe, "1m")
-        
-        uri = f"/futures/klines?symbol={symbol_clean}&interval={interval}&limit={limit}"
-        
+        resolution_map = {"1m": "1", "5m": "5", "15m": "15", "30m": "30", "1h": "60", "4h": "240"}
+        resolution = resolution_map.get(timeframe, "1")
+        to_timestamp = int(time.time())
+        step = 300 if timeframe == "5m" else 60
+        from_timestamp = to_timestamp - (limit * step)
+        uri = f"/futures/udf/history?symbol={symbol_clean}&resolution={resolution}&from={from_timestamp}&to={to_timestamp}&countback={limit}"
         try:
             response = requests.get(f"{self.base_url}{uri}", timeout=15)
             response.raise_for_status()
             data = response.json()
-            
-            if not data:
+            if not data or data.get('s') != 'ok':
                 return None
-            
-            # ★★★ تبدیل به لیست OHLCV (مطابق strategy_wrapper) ★★★
-            candles = []
-            for d in data:
-                candles.append(
-                    OHLCV(
-                        timestamp=int(d[0]),  # میلی‌ثانیه
-                        open=float(d[1]),
-                        high=float(d[2]),
-                        low=float(d[3]),
-                        close=float(d[4]),
-                        volume=float(d[5]),
-                        is_closed=True,
-                    )
-                )
-            
-            # همچنین دیتافریم برای محاسبات اندیکاتورها
             df = pd.DataFrame({
-                'timestamp': pd.to_datetime([d[0] for d in data], unit='ms', utc=True),
-                'open': pd.to_numeric([d[1] for d in data]),
-                'high': pd.to_numeric([d[2] for d in data]),
-                'low': pd.to_numeric([d[3] for d in data]),
-                'close': pd.to_numeric([d[4] for d in data]),
-                'volume': pd.to_numeric([d[5] for d in data])
+                'timestamp': pd.to_datetime(data['t'], unit='s', utc=True),
+                'open': pd.to_numeric(data['o']), 'high': pd.to_numeric(data['h']),
+                'low': pd.to_numeric(data['l']), 'close': pd.to_numeric(data['c']),
+                'volume': pd.to_numeric(data['v'])
             })
             df.set_index('timestamp', inplace=True)
-            
-            return df, candles
+            return df
         except Exception as e:
             logger.error(f"[FETCH ERROR] {symbol} ({timeframe}): {e}")
-            return None, None
+            return None
 
     def fetch_current_price(self, symbol):
         try:
-            df, _ = self.fetch_ohlcv(symbol, '1m', 2)
+            df = self.fetch_ohlcv(symbol, '1m', 2)
             if df is not None and not df.empty:
                 return float(df['close'].iloc[-1])
         except:
@@ -368,46 +258,27 @@ class BinanceData:
         return None
 
 # =====================================================================================
-# ★★★ کلاس صرافی بایننس ★★★
+# کلاس صرافی
 # =====================================================================================
-class BinancePrivateExchange:
-    def __init__(self, api_key, api_secret, base_url=BASE_URL):
+class TrueTradePrivateExchange:
+    def __init__(self, api_key, api_secret, base_url):
         self.api_key = api_key
         self.api_secret = api_secret
         self.base_url = base_url
         self.session = requests.Session()
         self.connected = False
-        self._last_response = None
 
-    def _sign_request(self, method, uri, params=None, body=None):
-        timestamp = int(time.time() * 1000)
-        query_string = ""
-        if params:
-            query_string = "&".join([f"{k}={v}" for k, v in sorted(params.items())])
-        if body:
-            body_str = json.dumps(body)
-            query_string = query_string + "&" + body_str if query_string else body_str
-        
-        signature_payload = f"{query_string}&timestamp={timestamp}" if query_string else f"timestamp={timestamp}"
-        signature = hmac.new(self.api_secret.encode(), signature_payload.encode(), hashlib.sha256).hexdigest()
-        
-        if params is None:
-            params = {}
-        params['timestamp'] = timestamp
-        params['signature'] = signature
-        return params
+    def _sign_request(self, method, uri, timestamp):
+        payload = f"{timestamp}{method.upper()}{uri}"
+        return hmac.new(self.api_secret.encode(), payload.encode(), hashlib.sha256).hexdigest()
 
-    def _request(self, method, uri, params=None, body=None):
-        params = self._sign_request(method, uri, params, body)
-        headers = {
-            "X-MBX-APIKEY": self.api_key,
-            "Content-Type": "application/json"
-        }
-        
-        url = f"{self.base_url}{uri}"
-        response = self.session.request(method, url, headers=headers, params=params, json=body, timeout=15)
+    def _request(self, method, uri, data=None):
+        timestamp = str(int(time.time() * 1000))
+        signature = self._sign_request(method, uri, timestamp)
+        headers = {"X-API-Key": self.api_key, "X-Timestamp": timestamp,
+                   "X-Signature": signature, "Content-Type": "application/json"}
+        response = self.session.request(method, f"{self.base_url}{uri}", headers=headers, json=data, timeout=15)
         self._last_response = response
-        
         if not response.ok:
             if response.status_code in [401, 403]:
                 self.connected = False
@@ -419,7 +290,7 @@ class BinancePrivateExchange:
 
     def test_connection(self):
         try:
-            self._request('GET', '/futures/v2/account')
+            self._request('GET', '/futures/positions')
             self.connected = True
             return True
         except Exception as e:
@@ -429,11 +300,15 @@ class BinancePrivateExchange:
 
     def fetch_balance(self):
         try:
-            data = self._request('GET', '/futures/v2/account')
-            assets = data.get('assets', [])
-            for asset in assets:
-                if asset.get('asset') == 'USDT':
-                    return float(asset.get('walletBalance', 0))
+            data = self._request('GET', '/futures/assets')
+            assets_list = []
+            if isinstance(data, dict) and 'assets' in data:
+                assets_list = data['assets']
+            elif isinstance(data, list):
+                assets_list = data
+            for asset in assets_list:
+                if asset.get('symbol') == 'USDT':
+                    return float(asset.get('availableBalance', asset.get('totalAssets', 0)))
             return 0
         except:
             return None
@@ -441,153 +316,133 @@ class BinancePrivateExchange:
     def _round_price(self, price, symbol):
         return round_price(price, symbol)
 
-    def _round_quantity(self, quantity, symbol):
-        """گرد کردن تعداد برای بایننس"""
-        qty_prec = self._get_quantity_precision(symbol)
-        return round(quantity, qty_prec)
-    
-    def _get_quantity_precision(self, symbol):
-        """دریافت دقت تعداد از بایننس"""
-        try:
-            info = self._request('GET', '/futures/v1/exchangeInfo')
-            for s in info.get('symbols', []):
-                if s.get('symbol') == symbol.upper():
-                    for f in s.get('filters', []):
-                        if f.get('filterType') == 'LOT_SIZE':
-                            step = float(f.get('stepSize'))
-                            return int(round(-_math.log10(step)))
-            return 3
-        except:
-            return 3
-
-    def fetch_price(self, symbol):
-        try:
-            data = self._request('GET', f'/futures/v1/ticker/price', params={'symbol': symbol.upper()})
-            return float(data.get('price', 0))
-        except:
-            return None
-
-    def _set_sl_tp(self, symbol, order_id, side, quantity, stop_loss, take_profit):
-        """تنظیم حد ضرر و حد سود برای بایننس"""
-        symbol_u = symbol.upper()
-        prec = PRICE_PRECISION.get(symbol_u, 2)
-        qty_prec = self._get_quantity_precision(symbol_u)
-        
-        # حد ضرر
-        sl_params = {
-            'symbol': symbol_u,
-            'side': 'SELL' if side.upper() == 'BUY' else 'BUY',
-            'type': 'STOP_MARKET',
-            'stopPrice': f"{round_price(stop_loss, symbol_u):.{prec}f}",
-            'quantity': f"{round(quantity, qty_prec):.{qty_prec}f}",
-            'workingType': 'MARK_PRICE'
-        }
-        try:
-            self._request('POST', '/futures/v1/order', body=sl_params)
-            logger.info(f"[SL] {symbol_u} Stop Loss set at {stop_loss}")
-        except Exception as e:
-            logger.error(f"[SL] Error setting stop loss: {e}")
-        
-        # حد سود
-        tp_params = {
-            'symbol': symbol_u,
-            'side': 'SELL' if side.upper() == 'BUY' else 'BUY',
-            'type': 'TAKE_PROFIT_MARKET',
-            'stopPrice': f"{round_price(take_profit, symbol_u):.{prec}f}",
-            'quantity': f"{round(quantity, qty_prec):.{qty_prec}f}",
-            'workingType': 'MARK_PRICE'
-        }
-        try:
-            self._request('POST', '/futures/v1/order', body=tp_params)
-            logger.info(f"[TP] {symbol_u} Take Profit set at {take_profit}")
-        except Exception as e:
-            logger.error(f"[TP] Error setting take profit: {e}")
-
     def create_order(self, symbol, order_type, side, capital, price=None, params=None):
-        """ثبت سفارش در بایننس فیوچرز"""
-        symbol_u = symbol.upper()
-        prec = PRICE_PRECISION.get(symbol_u, 2)
-        qty_prec = self._get_quantity_precision(symbol_u)
-        
-        # تنظیم اهرم
-        leverage = params.get('leverage', 1) if params else 1
-        try:
-            self._request('POST', f'/futures/v1/leverage', params={'symbol': symbol_u, 'leverage': leverage})
-        except:
-            pass
-        
-        # دریافت قیمت فعلی
-        current_price = price or self.fetch_price(symbol_u)
-        if not current_price:
-            raise ValueError(f"نمی‌توان قیمت {symbol_u} را دریافت کرد")
-        
-        quantity = (capital * leverage) / current_price
-        quantity = self._round_quantity(quantity, symbol_u)
-        
+        """
+        ثبت سفارش در صرافی + لاگ کامل (درخواست/پاسخ/خطا) هم در Logger و هم در تلگرام.
+        اگر SL/TP بعد از رند شدن به تیک نماد صفر شود، حذف می‌شود تا مقدار نامعتبر
+        به صرافی ارسال نشود (باگ ارزهای با اعشار بالا).
+        """
+        prec = PRICE_PRECISION.get(symbol.upper(), 2)
+        leverage = int(params.get('leverage', 1)) if params else 1
+
         order_data = {
-            'symbol': symbol_u,
-            'side': side.upper(),
-            'type': 'MARKET',
-            'quantity': f"{round(quantity, qty_prec):.{qty_prec}f}"
+            "symbol": symbol.upper(), "side": side.upper(), "tradeType": order_type.upper(),
+            "leverage": leverage, "cost": f"{capital:.{prec}f}", "walletType": "debit"
         }
-        
-        # ثبت سفارش اصلی
-        result = self._request('POST', '/futures/v1/order', body=order_data)
-        position_id = result.get('orderId')
-        
-        # ثبت SL/TP
-        stop_loss = params.get('stopLoss') if params else None
-        take_profit = params.get('takeProfit') if params else None
-        if stop_loss and take_profit:
-            self._set_sl_tp(symbol_u, position_id, side, quantity, stop_loss, take_profit)
-        
-        logger.info(f"[ORDER SUCCESS] {symbol_u} {side} | OrderId: {position_id}")
-        return {'id': position_id, 'symbol': symbol_u, 'side': side}
+        if order_type.upper() == "LIMIT" and price:
+            order_data["price"] = str(price)
+
+        if params:
+            if 'stopLoss' in params and params['stopLoss'] is not None:
+                rounded_sl = self._round_price(params['stopLoss'], symbol)
+                if rounded_sl and rounded_sl > 0:
+                    order_data["stopLoss"] = f"{rounded_sl:.{prec}f}"
+                else:
+                    logger.warning(f"[SL] {symbol}: مقدار حد ضرر پس از رند شدن صفر شد — از سفارش حذف شد")
+            if 'takeProfit' in params and params['takeProfit'] is not None:
+                rounded_tp = self._round_price(params['takeProfit'], symbol)
+                if rounded_tp and rounded_tp > 0:
+                    order_data["takeProfit"] = f"{rounded_tp:.{prec}f}"
+                else:
+                    logger.warning(f"[TP] {symbol}: مقدار حد سود پس از رند شدن صفر شد — از سفارش حذف شد")
+
+        logger.info(f"[ORDER REQUEST] {symbol.upper()} {side.upper()}\n{json.dumps(order_data, ensure_ascii=False, indent=2)}")
+        send_telegram_message(
+            f"📤 *ثبت سفارش — درخواست* {HASHTAGS['order_request']}\n"
+            f"━━━━━━━━━━━━━━━━━━━━━━\n"
+            f"🔹 نماد: `{symbol.upper()}`\n"
+            f"🔸 جهت: *{side.upper()}*  |  نوع: {order_type.upper()}\n"
+            f"💰 سرمایه: {capital:.{prec}f} USDT  |  🔧 اهرم: {leverage}x\n"
+            f"🛑 حد ضرر: {order_data.get('stopLoss', 'N/A')}\n"
+            f"🎯 حد سود: {order_data.get('takeProfit', 'N/A')}\n"
+            f"📦 Body:\n```\n{json.dumps(order_data, ensure_ascii=False, indent=2)}\n```\n"
+            f"━━━━━━━━━━━━━━━━━━━━━━\n🕒 {format_iran_time()}"
+        )
+
+        try:
+            result = self._request('POST', '/futures/positions', order_data)
+            position_id = result.get('positionId') if isinstance(result, dict) else None
+            logger.info(f"[ORDER SUCCESS] {symbol.upper()} {side.upper()}\n{json.dumps(result, ensure_ascii=False, indent=2) if isinstance(result, (dict, list)) else str(result)}")
+            send_telegram_message(
+                f"✅ *ثبت سفارش موفق* {HASHTAGS['order_response']}\n"
+                f"━━━━━━━━━━━━━━━━━━━━━━\n"
+                f"🔹 نماد: `{symbol.upper()}`  |  جهت: *{side.upper()}*\n"
+                f"🆔 Position ID: `{position_id or 'N/A'}`\n"
+                f"━━━━━━━━━━━━━━━━━━━━━━\n🕒 {format_iran_time()}"
+            )
+            return {'id': position_id, 'symbol': symbol, 'side': side}
+        except Exception as e:
+            response = getattr(self, '_last_response', None)
+            if response is not None:
+                try:
+                    parsed_text = json.dumps(response.json(), ensure_ascii=False, indent=2)
+                except Exception:
+                    parsed_text = "(پاسخ JSON معتبر نیست)"
+                complete_error = (
+                    f"HTTP STATUS: {response.status_code}\n"
+                    f"RAW:\n{response.text[:1500]}\n"
+                    f"PARSED:\n{parsed_text[:1500]}"
+                )
+            else:
+                complete_error = "پاسخی از صرافی دریافت نشد"
+            logger.error(
+                f"[ORDER FAILED] {symbol.upper()} {side.upper()}\n"
+                f"Body:\n{json.dumps(order_data, ensure_ascii=False, indent=2)}\n"
+                f"خطا:\n{complete_error}\n"
+                f"Exception: {repr(e)}"
+            )
+            send_telegram_message(
+                f"❌ *ثبت سفارش ناموفق* {HASHTAGS['order_error']}\n"
+                f"━━━━━━━━━━━━━━━━━━━━━━\n"
+                f"🔹 نماد: `{symbol.upper()}`  |  جهت: *{side.upper()}*\n"
+                f"📦 Body:\n```\n{json.dumps(order_data, ensure_ascii=False, indent=2)}\n```\n"
+                f"🔴 خطای کامل صرافی:\n```\n{complete_error[:1200]}\n```\n"
+                f"📝 Exception: {repr(e)[:300]}\n"
+                f"━━━━━━━━━━━━━━━━━━━━━━\n🕒 {format_iran_time()}"
+            )
+            raise
 
     def update_position_sl(self, position_id, symbol, stop_loss, take_profit=None):
         """
-        🛡️ ریسک‌فری: جابه‌جایی حد ضرر یک پوزیشن باز روی صرافی
+        🛡️ ریسک‌فری: جابه‌جایی حد ضرر یک پوزیشن باز روی صرافی (PATCH tpsl).
+        وقتی قیمت به فاصله‌ی ۱R از ورود برسد، حد ضرر به نقطه‌ی سر‌به‌سر (ورود)
+        منتقل می‌شود تا معامله دیگر نمی‌تواند به ضرر ختم شود.
         """
         symbol_u = symbol.upper()
         prec = PRICE_PRECISION.get(symbol_u, 2)
-        
-        # بایننس برای بروزرسانی SL/TP باید سفارش جدید ثبت کند و قدیمی را کنسل کند
+        body = {
+            "stopLoss": f"{self._round_price(stop_loss, symbol_u):.{prec}f}",
+            "stopLossStrategy": "LATEST_PRICE",
+            "stopLossOrderType": "STOP_MARKET",
+        }
+        if take_profit is not None:
+            body["takeProfit"] = f"{self._round_price(take_profit, symbol_u):.{prec}f}"
+
+        uri = f"/futures/positions/{position_id}/tpsl"
+        logger.info(f"[RISK-FREE] PATCH {uri} {body}")
         try:
-            # دریافت لیست سفارشات باز
-            orders = self._request('GET', '/futures/v1/openOrders', params={'symbol': symbol_u})
-            
-            for order in orders:
-                if order.get('type') in ['STOP_MARKET', 'TAKE_PROFIT_MARKET']:
-                    self._request('DELETE', '/futures/v1/order', params={
-                        'symbol': symbol_u,
-                        'orderId': order.get('orderId')
-                    })
-            
-            # ثبت استاپ جدید
-            if take_profit:
-                self._set_sl_tp(symbol_u, position_id, 'BUY', 0, stop_loss, take_profit)
-            else:
-                # فقط استاپ
-                sl_params = {
-                    'symbol': symbol_u,
-                    'side': 'SELL',
-                    'type': 'STOP_MARKET',
-                    'stopPrice': f"{round_price(stop_loss, symbol_u):.{prec}f}",
-                    'quantity': '0',  # مقدار از پوزیشن گرفته می‌شود
-                    'workingType': 'MARK_PRICE'
-                }
-                self._request('POST', '/futures/v1/order', body=sl_params)
-            
-            logger.info(f"[RISK-FREE] {symbol_u}: Stop Loss moved to {stop_loss}")
-            return {'status': 'success'}
+            result = self._request('PATCH', uri, body)
+            send_telegram_message(
+                f"🛡️ *ریسک‌فری فعال شد* {HASHTAGS['stop']}\n"
+                f"━━━━━━━━━━━━━━━━━━━━━━\n"
+                f"🔹 نماد: `{symbol_u}`\n"
+                f"🔒 حد ضرر جدید (سر‌به‌سر): {body['stopLoss']}\n"
+                f"━━━━━━━━━━━━━━━━━━━━━━\n🕒 {format_iran_time()}"
+            )
+            return result
         except Exception as e:
-            logger.error(f"[RISK-FREE] Error updating SL: {e}")
+            logger.error(f"[RISK-FREE] خطا در جابه‌جایی استاپ: {e}")
+            send_telegram_message(
+                f"⚠️ *خطا در ریسک‌فری* {HASHTAGS['order_error']}\n"
+                f"🔹 نماد: `{symbol_u}`\n📝 {str(e)[:200]}\n🕒 {format_iran_time()}"
+            )
             raise
 
 # =====================================================================================
 # توابع تلگرام
 # =====================================================================================
 def _send_telegram_single(text: str) -> bool:
+    """ارسال یک پیام تک به تلگرام با مدیریت خطای 429 (Rate Limit) و retry خودکار."""
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
     max_attempts = 3
     for attempt in range(max_attempts):
@@ -603,13 +458,15 @@ def _send_telegram_single(text: str) -> bool:
                 except Exception:
                     retry_after = 10
                 if attempt == max_attempts - 1:
+                    logger.error(f"[TELEGRAM] Rate limit after {max_attempts} attempts: {r.status_code} {r.text[:300]}")
                     return False
                 wait = min(retry_after + 2, 30)
-                logger.warning(f"[TELEGRAM] Rate limit — retry در {wait}s")
+                logger.warning(f"[TELEGRAM] Rate limit — retry در {wait}s (تلاش {attempt+1}/{max_attempts})")
                 time.sleep(wait)
                 continue
             if r.status_code == 200:
                 return True
+            # اگر Markdown پارس نشد (کاراکترهای خاص)، بدون parse_mode دوباره تلاش کن
             if r.status_code == 400 and attempt == 0:
                 try:
                     r2 = requests.post(url, json={"chat_id": TELEGRAM_CHAT_ID, "text": str(text)}, timeout=30)
@@ -617,6 +474,7 @@ def _send_telegram_single(text: str) -> bool:
                         return True
                 except Exception:
                     pass
+            logger.error(f"[TELEGRAM] ارسال ناموفق: {r.status_code} {r.text[:300]}")
             return False
         except Exception as e:
             logger.error(f"[TELEGRAM] Exception: {e}")
@@ -626,6 +484,10 @@ def _send_telegram_single(text: str) -> bool:
     return False
 
 def send_telegram_message(message: str) -> bool:
+    """
+    ارسال پیام به تلگرام — با پشتیبانی از پیام‌های بلند (بیش از ۴۰۰۰ کاراکتر)
+    که به‌صورت خودکار به چند بخش تقسیم می‌شوند، و مدیریت Rate-Limit تلگرام.
+    """
     text = str(message)
     if len(text) <= 4000:
         return _send_telegram_single(text)
@@ -636,11 +498,17 @@ def send_telegram_message(message: str) -> bool:
         time.sleep(1.0)
     return ok
 
+# نام مستعار برای هم‌خوانی با سایر ماژول‌ها
 send_telegram = send_telegram_message
+send_telegram_long = send_telegram_message
 
 IRAN_TZ = timezone(timedelta(hours=3, minutes=30))
 
 def format_iran_time(dt=None):
+    """
+    ✅ فیکس: اگر dt با تایم‌زون دیگری (مثلاً UTC از pandas) داده شود،
+    قبل از فرمت‌دهی به وقت ایران تبدیل می‌شود (قبلاً این تبدیل انجام نمی‌شد).
+    """
     if dt is None:
         dt = datetime.now(IRAN_TZ)
     else:
@@ -653,7 +521,7 @@ def format_iran_time(dt=None):
 
 def format_iran_date(dt=None):
     if dt is None:
-        dt = datetime.now(IRAN_TZ)
+        dt = datetime.now(timezone(timedelta(hours=3, minutes=30)))
     return dt.strftime('%Y-%m-%d')
 
 def round_price(price, symbol):
@@ -772,6 +640,7 @@ def find_pivot_low(low, left=LEFT_BARS, right=RIGHT_BARS):
             result.iloc[i] = low.iloc[i]
     return result
 
+# FIXED: رفع باگ slice در get_loc
 def resolve_bar_from_ts(df_indexed, ts):
     if ts is None or df_indexed is None or df_indexed.empty:
         return None
@@ -799,9 +668,15 @@ def resolve_bar_from_ts(df_indexed, ts):
     return None
 
 # =====================================================================================
-# ★ فیلتر روند SSL Hybrid
+# ★ فیلتر روند SSL Hybrid — با PyneCore (دقیقاً مثل Pine Script)
 # =====================================================================================
 def compute_ssl_hlv(df_5m):
+    """
+    محاسبه SSL Hybrid با استفاده از PyneCore
+    دقیقاً مطابق با کد Pine Script اصلی
+    
+    اگر ssl_hybrid.py خطا بده → None برمی‌گردونه و سیگنال‌دهی متوقف می‌شود
+    """
     global SSL_AVAILABLE, SSL_ERROR, SSL_ERROR_DETAIL
     
     if df_5m is None or len(df_5m) < SSL_BASELINE_LEN + 5:
@@ -831,6 +706,7 @@ def compute_ssl_hlv(df_5m):
             'close': df_5m['close'].values,
             'volume': df_5m['volume'].values if 'volume' in df_5m else None
         }
+        
         result = ssl_hybrid_indicator(data)
         hlv = result.get('hlv')
         
@@ -843,6 +719,7 @@ def compute_ssl_hlv(df_5m):
             else:
                 return 0
         
+        # اگر hlv معتبر نبود
         error_msg = (
             f"⚠️ *SSL Hybrid مقدار نامعتبر برگرداند* {HASHTAGS['ssl_status']}\n"
             f"━━━━━━━━━━━━━━━━━━━━━━\n"
@@ -881,6 +758,23 @@ def compute_ssl_hlv(df_5m):
         return None
 
 def compute_ssl_hlv_series(df_5m):
+    """
+    ★ نسخه‌ی سری‌زمانیِ SSL Hybrid — مخصوص گیت دقیق per-bar روی رویدادهای
+    تقاطع طلایی/مرگ (Golden/Death Cross).
+
+    چرا لازم است؟
+    در پاین، gate_long/gate_short با request.security(..., Hlv[1], lookahead_on)
+    محاسبه می‌شود که یعنی: «به‌ازای هر کندل ۱ دقیقه‌ای، آخرین کندل ۵ دقیقه‌ایِ
+    کاملاً بسته‌شده تا همان لحظه». این یعنی گیت SSL یک مقدار *تاریخی و
+    وابسته به لحظه‌ی دقیق تقاطع* است، نه یک مقدار واحدِ «همین الان».
+
+    نسخه‌ی قبلی (compute_ssl_hlv) فقط آخرین مقدار hlv را برمی‌گرداند و همان
+    یک مقدار به همه‌ی رویدادهای MA-cross پیدا شده در یک اجرا (که ممکن است
+    چند کندل قبل رخ داده باشند — مثلاً بعد از ری‌استارت ربات یا Catch-up)
+    اعمال می‌شود. این می‌تواند در حالت Catch-up باعث عدم تطابق دقیق با پاین شود.
+
+    خروجی: (hlv_index: DatetimeIndex هم‌طول df_5m, hlv_array: np.array) یا (None, None)
+    """
     global SSL_AVAILABLE
     if df_5m is None or len(df_5m) < SSL_BASELINE_LEN + 5 or not SSL_AVAILABLE:
         return None, None
@@ -901,7 +795,14 @@ def compute_ssl_hlv_series(df_5m):
         logger.error(f"[SSL-SERIES] Error: {e}")
         return None, None
 
+
 def get_hlv_at_ts(hlv_index, hlv_array, event_ts):
+    """
+    معادل دقیق «آخرین کندل ۵ دقیقه‌ایِ بسته‌شده تا لحظه‌ی رویداد» —
+    یعنی همان چیزی که Hlv[1] از طریق request.security(lookahead_on) در پاین
+    برمی‌گرداند. اگر داده‌ی سری‌زمانی در دسترس نباشد، None برمی‌گرداند تا
+    فراخواننده بتواند به مقدار fallback (آخرین hlv شناخته‌شده) برگردد.
+    """
     if hlv_index is None or hlv_array is None or event_ts is None:
         return None
     ts = pd.Timestamp(event_ts)
@@ -917,7 +818,9 @@ def get_hlv_at_ts(hlv_index, hlv_array, event_ts):
         return None
     return int(val)
 
+
 def compute_ssl_hybrid_status():
+    """گزارش وضعیت SSL Hybrid برای نمایش در استارتاپ"""
     if SSL_AVAILABLE:
         return (
             f"✅ *SSL Hybrid فعال است* {HASHTAGS['ssl_status']}\n"
@@ -988,6 +891,101 @@ def check_hammer(df, pivot_bar):
     return rng > 0 and w_bot >= body * 2.0 and w_bot >= w_top * 2.0 and body < rng * 0.4
 
 # =====================================================================================
+# ★★★ پردازش صف واگرایی‌های در انتظار کندل تأییدیه (Hammer/Shooting Star) ★★★
+#   مطابق i_req_pa_conf پاین: تا WAIT_BARS_PA_CONFIRM کندل بعد از تشکیل واگرایی
+#   کلاسیک، اگر کندل تأییدی روی «کندل جاری» (نه لزوماً پیوت) ظاهر شود، سیگنال
+#   نهایی می‌شود؛ در غیر این‌صورت پس از اتمام مهلت حذف می‌شود.
+#   چون ممکن است مهلت به کندل‌های بعد از پنجره‌ی فعلی کشیده شود، این صف در
+#   state ذخیره و بین فراخوانی‌های بعدی (و ری‌استارت‌ها، چون state پرسیست است)
+#   حفظ می‌شود.
+# =====================================================================================
+def process_pending_confirmations(closed_df_indexed, closed_df, pending_list, log_fn):
+    finalized = []
+    still_pending = []
+    idx = closed_df_indexed.index
+    for cand in pending_list:
+        start_ts = cand['confirm_start_ts']
+        deadline_ts = cand['deadline_ts']
+        mask = (idx >= start_ts) & (idx <= deadline_ts)
+        positions = np.where(mask)[0]
+        found = False
+        for wpos in positions:
+            ok = check_hammer(closed_df, wpos) if cand['direction'] == 'long' else check_shooting_star(closed_df, wpos)
+            if ok:
+                sig = dict(cand['signal'])
+                confirm_ts = idx[wpos]
+                sig['confirm_time'] = format_iran_time(confirm_ts)
+                finalized.append(sig)
+                log_fn(f"   ✅ کندل تأییدیه دریافت شد برای {sig['type']} @ {format_iran_time(confirm_ts)}")
+                found = True
+                break
+        if found:
+            continue
+        if len(idx) > 0 and idx[-1] >= deadline_ts:
+            log_fn(f"   ⌛ مهلت {WAIT_BARS_PA_CONFIRM} کندلی بدون تأییدیه به پایان رسید — {cand['signal']['type']} حذف شد")
+            continue
+        still_pending.append(cand)
+    return finalized, still_pending
+
+# =====================================================================================
+# Helper: Check bar distance between two pivots
+# =====================================================================================
+def check_bar_distance(bar1, bar2):
+    """Check if distance between two pivots is within acceptable range"""
+    if bar1 is None or bar2 is None:
+        return False
+    distance = abs(bar2 - bar1)
+    return MIN_BARS_BETWEEN_PIVOTS <= distance <= MAX_BARS_BETWEEN_PIVOTS
+
+# =====================================================================================
+# استاپ/تارگت
+# =====================================================================================
+def compute_divergence_sl_tp(p1_price, p2_price, direction, entry_price, symbol):
+    """
+    محاسبه استاپ/تارگت واگرایی — طبق قانون جدید:
+    • استاپ لانگ  = چند سنت (STOP_BUFFER_TICKS×تیک) پایین‌تر از پایین‌ترین
+                     قیمتِ دو دره‌ای که واگرایی رویشان تشخیص داده شده
+    • استاپ شورت = چند سنت (STOP_BUFFER_TICKS×تیک) بالاتر از بالاترین
+                     قیمتِ دو قله‌ای که واگرایی رویشان تشخیص داده شده
+    • تارگت      = همیشه با نسبت ریسک‌به‌ریوارد ثابت TARGET_RR (=3)
+    """
+    tick = TICK_SIZES.get(symbol.upper(), 0.01)
+    buffer_ = tick * STOP_BUFFER_TICKS
+
+    if direction == "long":
+        lowest_valley = min(p1_price, p2_price)
+        stop = lowest_valley - buffer_
+        risk = entry_price - stop
+    else:
+        highest_peak = max(p1_price, p2_price)
+        stop = highest_peak + buffer_
+        risk = stop - entry_price
+
+    if risk <= 0:
+        return None, None
+
+    target = entry_price + risk * TARGET_RR if direction == "long" else entry_price - risk * TARGET_RR
+    return stop, target
+
+def compute_cross_sl_tp(direction, entry_price, atr_val):
+    if direction == "long":
+        stop = entry_price - atr_val * CROSS_ATR_STOP_MULT
+        risk = entry_price - stop
+        target = entry_price + risk * TARGET_RR
+    else:
+        stop = entry_price + atr_val * CROSS_ATR_STOP_MULT
+        risk = stop - entry_price
+        target = entry_price - risk * TARGET_RR
+    return stop, target
+
+def score_stars(score):
+    if score >= 5: return "★★★★★"
+    if score >= 4: return "★★★★"
+    if score >= 3: return "★★★"
+    if score >= 2: return "★★"
+    return "★"
+
+# =====================================================================================
 # کلاس وضعیت (با state persistence)
 # =====================================================================================
 class SymbolState:
@@ -1000,8 +998,9 @@ class SymbolState:
         self.last_ma_ts = None
         self.telegram_log_count = 0
         self.last_telegram_log_time = 0
-        self.pending_bull_divs = []
-        self.pending_bear_divs = []
+        # ★★★ واگرایی‌های کلاسیکی که منتظر کندل تأییدیه (Hammer/Shooting Star) هستند ★★★
+        self.pending_bull_divs = []   # هر آیتم: {'signal':dict, 'confirm_start_ts':Timestamp, 'deadline_ts':Timestamp, 'direction':'long'}
+        self.pending_bear_divs = []   # مشابه برای شورت
 
     def to_dict(self):
         def _pending_to_dict(lst):
@@ -1134,6 +1133,23 @@ def load_signal_counter():
 # تقاطع طلایی/مرگ
 # =====================================================================================
 def process_ma_crosses(closed_df_indexed, ma_f, ma_m, ma_s, state, start_bar, end_bar, emit_from_bar=None):
+    """
+    محاسبه‌ی تقاطع طلایی/مرگ — دقیقاً بار‌به‌بار مطابق منطق پاین
+    (rst_l/rst_s + crossover/crossunder ma_f روی ma_m، هم‌جهت با ma_s).
+
+    ★★★ FIX — جلوگیری از معامله روی تقاطع‌های قدیمی (Catch-up) ★★★
+    این تابع کل بازه‌ی [start_bar..end_bar] را — همان‌طور که پاین بار به بار
+    انجام می‌دهد — پردازش می‌کند تا وضعیت‌های rst_l/rst_s همیشه صحیح و
+    پیوسته باقی بمانند (این بخش دست‌نخورده و کاملاً Pine-Exact است).
+    اما رویداد (event) فقط برای بارهایی برگردانده می‌شود که
+    `i >= emit_from_bar` باشد — یعنی فقط تقاطع‌های واقعاً «تازه» (نزدیک به
+    لحظه‌ی فعلی اجرای ربات). اگر بعد از ری‌استارت/گپ در داده مجبور به
+    Catch-up روی بازه‌ی بزرگی از کندل‌های گذشته شویم، تقاطع‌های قدیمی‌تر از
+    emit_from_bar فقط باعث به‌روزرسانی صحیح rst_l/rst_s می‌شوند و هرگز
+    سیگنال/معامله تولید نمی‌کنند.
+    اگر emit_from_bar=None باشد، همه‌ی رویدادها برگردانده می‌شوند (رفتار قدیم،
+    مثلاً برای گزارش تحلیلی ۲۴ ساعته که قرار نیست معامله‌ای انجام دهد).
+    """
     events = []
     skipped_old = 0
     for i in range(max(1, start_bar), end_bar + 1):
@@ -1182,11 +1198,15 @@ def save_debug_log_to_file(symbol, debug_log_lines):
         logger.error(f"[DEBUG FILE] Error writing log: {e}")
 
 # =====================================================================================
-# ★★★ تابع detect_signal — با استاپ/تارگت از strategy_wrapper ★★★
+# ★ بلوک ۲ — کل تابع detect_signal (جایگزین از def detect_signal تا قبل از def track_open_signals)
 # =====================================================================================
 def detect_signal(df_1m, df_5m, state, symbol, debug=False, allow_realtime_cross_trade=True):
     """
-    ★★★ نسخه اصلاح‌شده با استاپ/تارگت از strategy_wrapper ★★★
+    allow_realtime_cross_trade=True   → حالت عادی (لحظه‌ای/لایو): فقط تقاطع طلایی/مرگِ
+                                         واقعاً تازه (چند کندل آخر) سیگنال/معامله می‌شود.
+    allow_realtime_cross_trade=False  → حالت تحلیلی/گزارشی (مثل analyze_last_24h)، که
+                                         قرار نیست معامله‌ای انجام دهد و صرفاً می‌خواهد
+                                         همه‌ی تقاطع‌های بازه را ببیند.
     """
     debug_log = []
     debug_file_lines = []
@@ -1230,6 +1250,15 @@ def detect_signal(df_1m, df_5m, state, symbol, debug=False, allow_realtime_cross
     pivot_high = find_pivot_high(high, LEFT_BARS, RIGHT_BARS)
     pivot_low = find_pivot_low(low, LEFT_BARS, RIGHT_BARS)
 
+    # ------------------------------------------------------------------
+    # ★★★ رفع باگ اصلی: Replay کامل روی کل بازه‌ی جدید ★★★
+    #   نسخه‌ی قبلی فقط «یک نقطه‌ی واحد» (real_pivot_candidate = last - RIGHT_BARS)
+    #   را چک می‌کرد؛ یعنی اگر بین دو فراخوانی حتی یک کندل جا می‌ماند (یا در
+    #   گزارش ۲۴h که state همیشه خالی است) پیوت‌ها هرگز به ۲ عدد نمی‌رسیدند و
+    #   واگرایی از نظر ریاضی غیرممکن بود. حالا از آخرین جایی که پردازش شده
+    #   (last_processed_ts) — یا از ابتدای بازه در صورت نبود state — تا آخرین
+    #   پیوت ممکن حلقه می‌زنیم؛ دقیقاً مثل رفتار بار-به-بار Pine.
+    # ------------------------------------------------------------------
     last = n - 1
     end_scan_pos = last - RIGHT_BARS
 
@@ -1246,6 +1275,7 @@ def detect_signal(df_1m, df_5m, state, symbol, debug=False, allow_realtime_cross
         except Exception:
             start_scan_pos = LEFT_BARS
     else:
+        # state خالی است (اولین اجرا یا گزارش ۲۴h با temp_state) → کل بازه replay می‌شود
         start_scan_pos = LEFT_BARS
 
     start_scan_pos = max(start_scan_pos, LEFT_BARS)
@@ -1294,7 +1324,9 @@ def detect_signal(df_1m, df_5m, state, symbol, debug=False, allow_realtime_cross
     state.last_processed_ts = closed_df_indexed.index[last]
     log(f"   new_high={len(new_pivots_high)}, new_low={len(new_pivots_low)} | mem H={len(state.pivot_highs)} L={len(state.pivot_lows)} | scan=[{start_scan_pos}..{end_scan_pos}]")
 
+    # ------------------------------------------------------------------
     # تقاطع طلایی / مرگ
+    # ------------------------------------------------------------------
     ma_start_pos = 1
     ma_fallback_used = False
     if state.last_ma_ts is not None and state.last_ma_ts in closed_df_indexed.index:
@@ -1308,6 +1340,14 @@ def detect_signal(df_1m, df_5m, state, symbol, debug=False, allow_realtime_cross
     else:
         ma_fallback_used = True
 
+    # ★★★ FIX #1 — جلوگیری از معامله روی تقاطع‌های طلایی/مرگِ قدیمی (Catch-up) ★★★
+    # کل بازه‌ی [ma_start_pos..n-1] همچنان بار به بار پردازش می‌شود تا rst_l/rst_s
+    # همیشه صحیح باقی بمانند (دقیقاً مثل پاین)، اما «سیگنال/معامله» فقط برای
+    # تقاطع‌هایی صادر می‌شود که در همین چند کندل آخر (MAX_CROSS_EMIT_LOOKBACK_BARS)
+    # اتفاق افتاده باشند — یعنی همان لحظه‌ای که واقعاً روی چارت زنده رخ می‌دهد،
+    # نه لحظه‌ای که ربات به‌خاطر ری‌استارت/گپ به آن رسیده است.
+    # در حالت گزارش تحلیلی (allow_realtime_cross_trade=False) این محدودیت اعمال
+    # نمی‌شود چون قرار نیست معامله‌ای صورت بگیرد.
     emit_from_bar = None
     if allow_realtime_cross_trade:
         emit_from_bar = max(1, (n - 1) - MAX_CROSS_EMIT_LOOKBACK_BARS)
@@ -1320,18 +1360,22 @@ def detect_signal(df_1m, df_5m, state, symbol, debug=False, allow_realtime_cross
         closed_df_indexed, ma_f, ma_m, ma_s, state, ma_start_pos, n - 1, emit_from_bar=emit_from_bar
     )
     if ma_skipped_old:
-        log(f"   ⏮️ {ma_skipped_old} تقاطع طلایی/مرگ قدیمی (Catch-up) نادیده گرفته شد")
+        log(f"   ⏮️ {ma_skipped_old} تقاطع طلایی/مرگ قدیمی (Catch-up) نادیده گرفته شد — فقط rst_l/rst_s بروزرسانی شد، معامله‌ای صورت نگرفت")
     state.last_ma_ts = closed_df_indexed.index[n - 1]
 
-    # ✅ فیلتر SSL Hybrid
+    # ------------------------------------------------------------------
+    # ✅ فیلتر SSL Hybrid — تک‌تایم‌فریمی 5m — گیت روی همه سیگنال‌ها
+    # ------------------------------------------------------------------
     hlv = compute_ssl_hlv(df_5m)
+    
+    # ★ اگر hlv None باشه، یعنی SSL Hybrid خطا داده → سیگنال‌دهی متوقف
     if hlv is None:
         log("   ❌ SSL Hybrid Error - SIGNALS DISABLED")
-        return [], debug_log
+        return [], debug_log  # ← هیچ سیگنالی برنمی‌گردونه
     
     gate_long = hlv == 1
     gate_short = hlv == -1
-    log(f"   SSL(5m) Hlv={hlv} | gate_long={gate_long} gate_short={gate_short}")
+    log(f"   SSL(5m) Hlv={hlv} | gate_long={gate_long} gate_short={gate_short} | Hlv=0 → هر دو مسدود")
 
     entry_price = float(close.iloc[-1])
     atr_now = float(atr14.iloc[-1]) if not pd.isna(atr14.iloc[-1]) else 0.0
@@ -1341,25 +1385,21 @@ def detect_signal(df_1m, df_5m, state, symbol, debug=False, allow_realtime_cross
     new_classic_bear_candidates = []
     cross_signals = []
 
+    # ─────────────────────────────────────────────────────────────────
+    # ★★★ گیت SSL دقیقِ per-bar برای تقاطع طلایی/مرگ ★★★
+    # به‌جای اعمال یک مقدار «فعلی» hlv به همه‌ی رویدادهای این batch،
+    # مقدار SSL را دقیقاً در همان لحظه‌ی هر تقاطع (Hlv[1] معادل پاین)
+    # می‌خوانیم — یعنی همان مقداری که پاین در لحظه‌ی رسم برچسب روی چارت
+    # از آن استفاده می‌کند. اگر سری‌زمانی در دسترس نبود، به مقدار scalar
+    # فعلی (رفتار قبلی) به‌عنوان fallback برمی‌گردیم تا هیچ سیگنالی از دست نرود.
+    # ─────────────────────────────────────────────────────────────────
     hlv_index, hlv_array = compute_ssl_hlv_series(df_5m)
 
-    # ★★★ دریافت tick info برای محاسبه استاپ/تارگت ★★★
-    tick_info = SYMBOL_TICK_INFO.get(symbol.upper(), {"mintick": 0.01})
-    mintick = tick_info["mintick"]
-    
-    # ★★★ تعیین buffer_ticks بر اساس نماد (مطابق strategy_wrapper) ★★★
-    if symbol in ["BNBUSDT", "ETHUSDT"]:
-        buffer_ticks = 9
-    elif symbol in ["LTCUSDT", "DOGEUSDT"]:
-        buffer_ticks = 3
-    else:
-        buffer_ticks = 5
-
-    # تقاطع طلایی/مرگ (با استاپ/تارگت ATR — قدیمی)
+    # تقاطع طلایی/مرگ (با گیت SSL دقیق per-bar — مثل Pine)
     for etype, ets in ma_events:
         hlv_evt = get_hlv_at_ts(hlv_index, hlv_array, ets)
         if hlv_evt is None:
-            hlv_evt = hlv
+            hlv_evt = hlv  # fallback به آخرین مقدار شناخته‌شده
         gate_long_evt = hlv_evt == 1
         gate_short_evt = hlv_evt == -1
 
@@ -1379,26 +1419,35 @@ def detect_signal(df_1m, df_5m, state, symbol, debug=False, allow_realtime_cross
                 'extra': "⬇تقاطع مرگ", 'score': 0, 'time': format_iran_time(ets)
             })
             log(f"   ⬇️ Death Cross @ {ets} | Hlv(event)={hlv_evt}")
+        elif etype in ("BUY_CROSS", "SELL_CROSS"):
+            log(f"   ⛔ {etype} @ {ets} رد شد — Hlv(event)={hlv_evt} با گیت هم‌جهت نیست")
 
-    # ★★★ واگرایی نزولی — با استاپ/تارگت از strategy_wrapper ★★★
+    # ------------------------------------------------------------------
+    # ★★★ واگرایی نزولی — روی هر پیوت جدید (نه فقط آخرین) ★★★
+    #   قبلاً فقط new_pivots_high[0] چک می‌شد؛ حالا همه‌ی پیوت‌های جدیدِ این
+    #   Replay به‌ترتیب زمانی پردازش می‌شوند تا هیچ واگرایی‌ای از قلم نیفتد.
+    # ----------------------------------------------------------------------
     for new_ph in new_pivots_high:
         idx = next((i for i, p in enumerate(state.pivot_highs) if p['ts'] == new_ph['ts']), None)
         if idx is None or idx < 1:
             continue
-        ph_1 = state.pivot_highs[idx - 1]
-        ph_2 = state.pivot_highs[idx]
+        ph_1 = state.pivot_highs[idx - 1]   # پیوت قبلی
+        ph_2 = state.pivot_highs[idx]       # پیوت جدید
         bar1 = resolve_bar_from_ts(closed_df_indexed, ph_1['ts'])
         bar2 = resolve_bar_from_ts(closed_df_indexed, ph_2['ts'])
         if bar1 is None or bar2 is None:
             continue
         confirm_bar = min(bar2 + RIGHT_BARS, last)
 
+        # ✅ گیت SSL + ADX: مثل «ورود واقعی» در Pine — برچسب فقط با gate_short نمایش داده می‌شود
         if not (trending.iloc[confirm_bar] and gate_short):
             continue
 
+        # ── کلاسیک نزولی: سقف بالاتر + اندیکاتور پایین‌تر ──
         if ph_2['price'] > ph_1['price']:
             div_rsi = ph_2['rsi'] < ph_1['rsi']
             div_macd = ph_2['macdline'] < ph_1['macdline']
+            # div_hist در Pine به‌دلیل ریستِ min_h_ph روی کندل تأیید هرگز true نمی‌شود
             div_hist = False
 
             if div_rsi or div_macd or div_hist:
@@ -1408,31 +1457,13 @@ def detect_signal(df_1m, df_5m, state, symbol, debug=False, allow_realtime_cross
                 log(f"   🔴 Classic Bearish [{bar1}↔{bar2}]: score={score}/5")
 
                 if score >= MIN_CLASSIC_SCORE:
-                    # ★★★ ساخت last_values برای تابع compute_stop_target_from_wrapper ★★★
-                    last_values = {
-                        "entry": entry_price,
-                        "previous_pivot_high_price": ph_1['price'],
-                        "pivot_high_price": ph_2['price'],
-                        "previous_pivot_high_index": bar1,
-                        "pivot_high_index": bar2,
-                    }
-                    
-                    # ★★★ محاسبه استاپ/تارگت با تابع strategy_wrapper ★★★
-                    stop, target, rr_value, structural_level = compute_stop_target_from_wrapper(
-                        [], "SHORT", last_values, mintick, buffer_ticks
-                    )
-                    
-                    # ★★★ اگر محاسبه استاپ/تارگت با شکست مواجه شد، از روش قدیمی استفاده کن ★★★
-                    if stop is None or target is None:
-                        stop, target = compute_divergence_sl_tp(ph_1['price'], ph_2['price'], "short", entry_price, symbol)
-                    
+                    stop, target = compute_divergence_sl_tp(ph_1['price'], ph_2['price'], "short", entry_price, symbol)
                     if stop and target:
                         sig = {
                             'type': 'CLASSIC_BEARISH_DIV', 'direction': 'SELL',
                             'entry': entry_price, 'stop': stop, 'target': target,
                             'extra': f"{score_stars(score)}\nواگرایی↓[{score}/5]", 'score': score,
-                            'time': format_iran_time(ph_2['ts']), 'pivot_ts': str(ph_2['ts']),
-                            'structural_level': structural_level  # برای ریسک‌فری
+                            'time': format_iran_time(ph_2['ts']), 'pivot_ts': str(ph_2['ts'])
                         }
                         if REQUIRE_PA_CONFIRMATION:
                             confirm_start_ts = closed_df_indexed.index[confirm_bar]
@@ -1446,53 +1477,44 @@ def detect_signal(df_1m, df_5m, state, symbol, debug=False, allow_realtime_cross
                             hidden_signals.append(sig)
                             log(f"   🔴 Classic Bearish Div SELECTED: score={score}/5")
 
-        # مخفی نزولی
+        # ── مخفی نزولی: سقف پایین‌تر + اندیکاتور بالاتر (بدون گیت تأییدیه، مطابق Pine) ──
         elif ph_2['price'] < ph_1['price']:
             hid = (ph_2['rsi'] > ph_1['rsi']) or (ph_2['macdline'] > ph_1['macdline'])
             if hid:
-                last_values = {
-                    "entry": entry_price,
-                    "previous_pivot_high_price": ph_1['price'],
-                    "pivot_high_price": ph_2['price'],
-                    "previous_pivot_high_index": bar1,
-                    "pivot_high_index": bar2,
-                }
-                stop, target, rr_value, structural_level = compute_stop_target_from_wrapper(
-                    [], "SHORT", last_values, mintick, buffer_ticks
-                )
-                if stop is None or target is None:
-                    stop, target = compute_divergence_sl_tp(ph_1['price'], ph_2['price'], "short", entry_price, symbol)
-                
+                stop, target = compute_divergence_sl_tp(ph_1['price'], ph_2['price'], "short", entry_price, symbol)
                 if stop and target:
                     hidden_signals.append({
                         'type': 'HIDDEN_BEARISH_DIV', 'direction': 'SELL',
                         'entry': entry_price, 'stop': stop, 'target': target,
                         'extra': "~واگرایی مخفی↓", 'score': 0,
-                        'time': format_iran_time(ph_2['ts']), 'pivot_ts': str(ph_2['ts']),
-                        'structural_level': structural_level
+                        'time': format_iran_time(ph_2['ts']), 'pivot_ts': str(ph_2['ts'])
                     })
                     log(f"   🟠 Hidden Bearish Div [{bar1}↔{bar2}]")
 
-    # ★★★ واگرایی صعودی — با استاپ/تارگت از strategy_wrapper ★★★
+    # ------------------------------------------------------------------
+    # ★★★ واگرایی صعودی — روی هر پیوت جدید (نه فقط آخرین) ★★★
+    # ------------------------------------------------------------------
     for new_pl in new_pivots_low:
         idx = next((i for i, p in enumerate(state.pivot_lows) if p['ts'] == new_pl['ts']), None)
         if idx is None or idx < 1:
             continue
-        pl_1 = state.pivot_lows[idx - 1]
-        pl_2 = state.pivot_lows[idx]
+        pl_1 = state.pivot_lows[idx - 1]   # پیوت قبلی
+        pl_2 = state.pivot_lows[idx]       # پیوت جدید
         bar1 = resolve_bar_from_ts(closed_df_indexed, pl_1['ts'])
         bar2 = resolve_bar_from_ts(closed_df_indexed, pl_2['ts'])
         if bar1 is None or bar2 is None:
             continue
         confirm_bar = min(bar2 + RIGHT_BARS, last)
 
+        # ✅ گیت SSL + ADX: مثل «ورود واقعی» در Pine — برچسب فقط با gate_long نمایش داده می‌شود
         if not (trending.iloc[confirm_bar] and gate_long):
             continue
 
+        # ── کلاسیک صعودی: کف پایین‌تر + اندیکاتور بالاتر ──
         if pl_2['price'] < pl_1['price']:
             div_rsi = pl_2['rsi'] > pl_1['rsi']
             div_macd = pl_2['macdline'] > pl_1['macdline']
-            div_hist = False
+            div_hist = False   # در Pine هرگز true نمی‌شود (باگ ریست max_h_pl)
 
             if div_rsi or div_macd or div_hist:
                 fib_ok = check_fib_near(high, low, bar2, pl_2['price'], is_high_side=False, tol_pct=FIB_TOLERANCE_PCT)
@@ -1501,26 +1523,13 @@ def detect_signal(df_1m, df_5m, state, symbol, debug=False, allow_realtime_cross
                 log(f"   🟢 Classic Bullish [{bar1}↔{bar2}]: score={score}/5")
 
                 if score >= MIN_CLASSIC_SCORE:
-                    last_values = {
-                        "entry": entry_price,
-                        "previous_pivot_low_price": pl_1['price'],
-                        "pivot_low_price": pl_2['price'],
-                        "previous_pivot_low_index": bar1,
-                        "pivot_low_index": bar2,
-                    }
-                    stop, target, rr_value, structural_level = compute_stop_target_from_wrapper(
-                        [], "LONG", last_values, mintick, buffer_ticks
-                    )
-                    if stop is None or target is None:
-                        stop, target = compute_divergence_sl_tp(pl_1['price'], pl_2['price'], "long", entry_price, symbol)
-                    
+                    stop, target = compute_divergence_sl_tp(pl_1['price'], pl_2['price'], "long", entry_price, symbol)
                     if stop and target:
                         sig = {
                             'type': 'CLASSIC_BULLISH_DIV', 'direction': 'BUY',
                             'entry': entry_price, 'stop': stop, 'target': target,
                             'extra': f"{score_stars(score)}\nواگرایی↑[{score}/5]", 'score': score,
-                            'time': format_iran_time(pl_2['ts']), 'pivot_ts': str(pl_2['ts']),
-                            'structural_level': structural_level
+                            'time': format_iran_time(pl_2['ts']), 'pivot_ts': str(pl_2['ts'])
                         }
                         if REQUIRE_PA_CONFIRMATION:
                             confirm_start_ts = closed_df_indexed.index[confirm_bar]
@@ -1534,34 +1543,23 @@ def detect_signal(df_1m, df_5m, state, symbol, debug=False, allow_realtime_cross
                             hidden_signals.append(sig)
                             log(f"   🟢 Classic Bullish Div SELECTED: score={score}/5")
 
-        # مخفی صعودی
+        # ── مخفی صعودی: کف بالاتر + اندیکاتور پایین‌تر (بدون گیت تأییدیه، مطابق Pine) ──
         elif pl_2['price'] > pl_1['price']:
             hid = (pl_2['rsi'] < pl_1['rsi']) or (pl_2['macdline'] < pl_1['macdline'])
             if hid:
-                last_values = {
-                    "entry": entry_price,
-                    "previous_pivot_low_price": pl_1['price'],
-                    "pivot_low_price": pl_2['price'],
-                    "previous_pivot_low_index": bar1,
-                    "pivot_low_index": bar2,
-                }
-                stop, target, rr_value, structural_level = compute_stop_target_from_wrapper(
-                    [], "LONG", last_values, mintick, buffer_ticks
-                )
-                if stop is None or target is None:
-                    stop, target = compute_divergence_sl_tp(pl_1['price'], pl_2['price'], "long", entry_price, symbol)
-                
+                stop, target = compute_divergence_sl_tp(pl_1['price'], pl_2['price'], "long", entry_price, symbol)
                 if stop and target:
                     hidden_signals.append({
                         'type': 'HIDDEN_BULLISH_DIV', 'direction': 'BUY',
                         'entry': entry_price, 'stop': stop, 'target': target,
                         'extra': "~واگرایی مخفی↑", 'score': 0,
-                        'time': format_iran_time(pl_2['ts']), 'pivot_ts': str(pl_2['ts']),
-                        'structural_level': structural_level
+                        'time': format_iran_time(pl_2['ts']), 'pivot_ts': str(pl_2['ts'])
                     })
                     log(f"   🔵 Hidden Bullish Div [{bar1}↔{bar2}]")
 
-    # پردازش صف تأییدیه
+    # ------------------------------------------------------------------
+    # ★★★ پردازش صف تأییدیه (قدیمی + جدید) — فقط واگرایی کلاسیک ★★★
+    # ------------------------------------------------------------------
     confirmed_bull_signals = []
     confirmed_bear_signals = []
     if REQUIRE_PA_CONFIRMATION:
@@ -1572,7 +1570,9 @@ def detect_signal(df_1m, df_5m, state, symbol, debug=False, allow_realtime_cross
         confirmed_bear_signals, state.pending_bear_divs = process_pending_confirmations(
             closed_df_indexed, closed_df, bear_queue, log)
 
+    # ------------------------------------------------------------------
     # جمع‌آوری نهایی
+    # ------------------------------------------------------------------
     signals = []
     signals.extend(confirmed_bull_signals)
     signals.extend(confirmed_bear_signals)
@@ -1588,76 +1588,7 @@ def detect_signal(df_1m, df_5m, state, symbol, debug=False, allow_realtime_cross
     return signals, debug_log
 
 # =====================================================================================
-# توابع کمکی برای استاپ/تارگت
-# =====================================================================================
-def compute_divergence_sl_tp(p1_price, p2_price, direction, entry_price, symbol):
-    """روش قدیمی استاپ/تارگت — به‌عنوان fallback"""
-    tick = TICK_SIZES.get(symbol.upper(), 0.01)
-    buffer_ = tick * 5  # استفاده از بافر ثابت 5 تیک
-
-    if direction == "long":
-        lowest_valley = min(p1_price, p2_price)
-        stop = lowest_valley - buffer_
-        risk = entry_price - stop
-    else:
-        highest_peak = max(p1_price, p2_price)
-        stop = highest_peak + buffer_
-        risk = stop - entry_price
-
-    if risk <= 0:
-        return None, None
-
-    target = entry_price + risk * 2.0 if direction == "long" else entry_price - risk * 2.0
-    return stop, target
-
-def compute_cross_sl_tp(direction, entry_price, atr_val):
-    if direction == "long":
-        stop = entry_price - atr_val * CROSS_ATR_STOP_MULT
-        risk = entry_price - stop
-        target = entry_price + risk * 2.0
-    else:
-        stop = entry_price + atr_val * CROSS_ATR_STOP_MULT
-        risk = stop - entry_price
-        target = entry_price - risk * 2.0
-    return stop, target
-
-def score_stars(score):
-    if score >= 5: return "★★★★★"
-    if score >= 4: return "★★★★"
-    if score >= 3: return "★★★"
-    if score >= 2: return "★★"
-    return "★"
-
-def process_pending_confirmations(closed_df_indexed, closed_df, pending_list, log_fn):
-    finalized = []
-    still_pending = []
-    idx = closed_df_indexed.index
-    for cand in pending_list:
-        start_ts = cand['confirm_start_ts']
-        deadline_ts = cand['deadline_ts']
-        mask = (idx >= start_ts) & (idx <= deadline_ts)
-        positions = np.where(mask)[0]
-        found = False
-        for wpos in positions:
-            ok = check_hammer(closed_df, wpos) if cand['direction'] == 'long' else check_shooting_star(closed_df, wpos)
-            if ok:
-                sig = dict(cand['signal'])
-                confirm_ts = idx[wpos]
-                sig['confirm_time'] = format_iran_time(confirm_ts)
-                finalized.append(sig)
-                log_fn(f"   ✅ کندل تأییدیه دریافت شد برای {sig['type']} @ {format_iran_time(confirm_ts)}")
-                found = True
-                break
-        if found:
-            continue
-        if len(idx) > 0 and idx[-1] >= deadline_ts:
-            log_fn(f"   ⌛ مهلت به پایان رسید — {cand['signal']['type']} حذف شد")
-            continue
-        still_pending.append(cand)
-    return finalized, still_pending
-
-# =====================================================================================
-# پیگیری سیگنال‌های باز
+# پیگیری سیگنال‌های باز — با قیمت لحظه‌ای صرافی
 # =====================================================================================
 def track_open_signals(data, exchange=None):
     history = load_history()
@@ -1705,6 +1636,7 @@ def track_open_signals(data, exchange=None):
                 f"💰 سود: +{profit_pct:.2f}%  |  +{profit_usdt:.2f} USDT\n"
                 f"━━━━━━━━━━━━━━━━━━━━━━\n🕒 {format_iran_time()}"
             )
+            logger.info(f"[TRACK] TAKE_PROFIT: {symbol} {direction} | PnL: +{profit_usdt:.2f} USDT")
             continue
 
         elif hit_stop:
@@ -1720,39 +1652,30 @@ def track_open_signals(data, exchange=None):
                 f"💸 ضرر: -{loss_pct:.2f}%  |  -{loss_usdt:.2f} USDT\n"
                 f"━━━━━━━━━━━━━━━━━━━━━━\n🕒 {format_iran_time()}"
             )
+            logger.info(f"[TRACK] STOP_LOSS: {symbol} {direction} | PnL: -{loss_usdt:.2f} USDT")
             continue
 
-        # 🛡️ ریسک‌فری
+        # ---------------- 🛡️ ریسک‌فری: انتقال استاپ به نقطه سر‌به‌سر با رسیدن به 1R ----------------
         if (exchange is not None and exchange.connected and not trade.get('risk_free_done')
                 and trade.get('position_id') and trade.get('position_id') != 'N/A'):
-            # ★★★ استفاده از structural_level برای ریسک‌فری ★★★
-            structural_level = trade.get('structural_level')
-            if structural_level is not None:
-                risk_dist = abs(entry - stop)
-                if risk_dist > 0:
-                    if direction == 'BUY':
-                        one_r_hit = cp >= entry + risk_dist
-                        # نقطه ریسک‌فری روی structural_level یا 1R
-                        risk_free_price = max(structural_level, entry + risk_dist)
-                    else:
-                        one_r_hit = cp <= entry - risk_dist
-                        risk_free_price = min(structural_level, entry - risk_dist)
-                    
-                    if one_r_hit:
-                        try:
-                            exchange.update_position_sl(trade['position_id'], symbol, risk_free_price, take_profit=target)
-                            trade['risk_free_done'] = True
-                            trade['stop_loss'] = risk_free_price
-                            save_history(history)
-                            logger.info(f"[RISK-FREE] {symbol} #{signal_number}: استاپ به {risk_free_price} منتقل شد")
-                        except Exception as e:
-                            logger.error(f"[RISK-FREE] {symbol} #{signal_number}: خطا — {e}")
+            risk_dist = abs(entry - stop)
+            if risk_dist > 0:
+                one_r_hit = (cp >= entry + risk_dist) if direction == 'BUY' else (cp <= entry - risk_dist)
+                if one_r_hit:
+                    try:
+                        exchange.update_position_sl(trade['position_id'], symbol, entry, take_profit=target)
+                        trade['risk_free_done'] = True
+                        trade['stop_loss'] = entry
+                        save_history(history)
+                        logger.info(f"[RISK-FREE] {symbol} #{signal_number}: استاپ به سر‌به‌سر ({entry}) منتقل شد")
+                    except Exception as e:
+                        logger.error(f"[RISK-FREE] {symbol} #{signal_number}: خطا — {e}")
 
 # =====================================================================================
 # توابع گزارش
 # =====================================================================================
 def send_reports(exchange):
-    now = datetime.now(IRAN_TZ)
+    now = datetime.now(timezone(timedelta(hours=3, minutes=30)))
     today_str = format_iran_date()
 
     try:
@@ -1824,10 +1747,10 @@ def run_startup_diagnostic():
         diagnostic_log.append("🟢 اتصال اینترنت")
     except:
         diagnostic_log.append("🔴 اتصال اینترنت")
-    data = BinanceData()
-    df, candles = None, None
+    data = TrueTradeData()
+    df = None
     try:
-        df, candles = data.fetch_ohlcv("LTCUSDT", "1m", 1500)
+        df = data.fetch_ohlcv("LTCUSDT", "1m", 1500)
         if df is not None and not df.empty:
             diagnostic_log.append(f"🟢 دریافت داده: {len(df)} کندل")
         else:
@@ -1847,7 +1770,7 @@ def run_startup_diagnostic():
         diagnostic_log.append(f"🔴 خطا: {str(e)[:50]}")
     diagnostic_log.append("🟢 موتور سیگنال: آماده")
     diagnostic_log.append("🟢 اتصال به تلگرام")
-    exchange = BinancePrivateExchange(API_KEY, API_SECRET, BASE_URL)
+    exchange = TrueTradePrivateExchange(API_KEY, API_SECRET, BASE_URL)
     conn = exchange.test_connection()
     if conn:
         diagnostic_log.append("🟢 اتصال به صرافی: برقرار")
@@ -1869,7 +1792,7 @@ def analyze_and_execute():
     global FIRST_RUN
     
     logger.info("[ANALYZE] شروع...")
-    exchange = BinancePrivateExchange(API_KEY, API_SECRET, BASE_URL)
+    exchange = TrueTradePrivateExchange(API_KEY, API_SECRET, BASE_URL)
     conn = exchange.test_connection()
     balance = exchange.fetch_balance() if conn else 0
     if balance is None:
@@ -1886,15 +1809,15 @@ def analyze_and_execute():
         balance_text = f"\n💰 موجودی حساب فیوچرز: {balance:.2f} USDT" if balance else ""
         send_telegram_message(f"🔄 تغییر وضعیت صرافی {HASHTAGS['connection_change']}\n\n{status_text}{balance_text}\n🕒 {format_iran_time()}")
 
-    data = BinanceData()
+    data = TrueTradeData()
     track_open_signals(data, exchange)
 
     side_map = {"BUY": "LONG", "SELL": "SHORT"}
 
     for symbol in SYMBOLS:
         try:
-            df_1m, candles_1m = data.fetch_ohlcv(symbol, MAIN_TIMEFRAME, HISTORY_BARS)
-            df_5m, _ = data.fetch_ohlcv(symbol, SSL_TIMEFRAME, 500)
+            df_1m = data.fetch_ohlcv(symbol, MAIN_TIMEFRAME, HISTORY_BARS)
+            df_5m = data.fetch_ohlcv(symbol, SSL_TIMEFRAME, 500)
             if df_1m is None or df_1m.empty:
                 logger.warning(f"[SKIP] {symbol}: داده 1m نیست")
                 continue
@@ -1904,12 +1827,15 @@ def analyze_and_execute():
             signals, _ = detect_signal(df_1m, df_5m, SYMBOL_STATES[symbol], symbol, debug=True,
                                         allow_realtime_cross_trade=True)
 
+            # ★★★ اگر اولین بار اجراست، فقط ۲ سیگنال آخر (جدیدترین) رو بگیر ★★★
             if FIRST_RUN and len(signals) > 2:
                 logger.info(f"[FIRST_RUN] {symbol}: {len(signals)} سیگنال یافت شد، فقط ۲ تای آخر ارسال می‌شوند")
                 signals = signals[-2:]
 
+            # ★★★ اگر اولین بار اجراست و سیگنال وجود داره، فقط نمایش بده و معامله نکن ★★★
             for sig in signals:
                 if FIRST_RUN:
+                    # فقط پیام نمایشی بفرست - بدون ثبت در history و بدون معامله
                     direction = sig['direction']
                     dir_emoji = "🟢" if direction == "BUY" else "🔴"
                     dir_txt = "LONG" if direction == "BUY" else "SHORT"
@@ -1943,6 +1869,7 @@ def analyze_and_execute():
                     send_telegram_message(signal_message)
                     continue
 
+                # ★★★ پردازش عادی سیگنال (برای اجراهای بعدی) ★★★
                 entry = round_price(sig['entry'], symbol)
                 stop = round_price(sig['stop'], symbol)
                 target = round_price(sig['target'], symbol)
@@ -1979,9 +1906,6 @@ def analyze_and_execute():
                 qty = (capital * used_leverage) / entry
                 potential_profit = capital * used_leverage * (profit_pct / 100)
 
-                # ★★★ ذخیره structural_level برای ریسک‌فری ★★★
-                structural_level = sig.get('structural_level')
-
                 signal_message = (
                     f"{dir_emoji} *سیگنال جدید* — {sig['type']} — `{symbol}` {HASHTAGS['signal']} #Signal_{signal_number}\n"
                     f"━━━━━━━━━━━━━━━━━━━━━━\n"
@@ -2002,7 +1926,16 @@ def analyze_and_execute():
                     send_telegram_message(signal_message)
                 except Exception as e:
                     logger.error(f"[TELEGRAM SIGNAL ERROR] {symbol}: {e}")
-
+                    fallback_msg = (
+                        f"{dir_emoji} سیگنال {sig['type']} — {symbol} {HASHTAGS['signal']} #Signal_{signal_number}\n"
+                        f"📍 ورود: {entry:.{PRICE_PRECISION.get(symbol, 2)}f}\n"
+                        f"🛑 حد ضرر: {stop:.{PRICE_PRECISION.get(symbol, 2)}f} | 🎯 حد سود: {target:.{PRICE_PRECISION.get(symbol, 2)}f}\n"
+                        f"🕒 {current_signal_time}"
+                    )
+                    try:
+                        send_telegram_message(fallback_msg)
+                    except:
+                        pass
                 time.sleep(0.5)
 
                 history = load_history()
@@ -2013,8 +1946,7 @@ def analyze_and_execute():
                     'type': sig['type'], 'capital': capital,
                     'leverage': int(used_leverage), 'qty': qty,
                     'signal_number': signal_number,
-                    'position_id': None, 'risk_free_done': False,
-                    'structural_level': structural_level  # ★★★ برای ریسک‌فری
+                    'position_id': None, 'risk_free_done': False
                 })
                 save_history(history)
 
@@ -2057,6 +1989,7 @@ def analyze_and_execute():
         except Exception as e:
             logger.error(f"[ERROR] {symbol}: {e}")
 
+    # ★★★ بعد از اولین اجرا، فلگ را False کن ★★★
     if FIRST_RUN:
         FIRST_RUN = False
         logger.info("[FIRST_RUN] حالت اولین اجرا به پایان رسید - ربات وارد حالت عادی می‌شود")
@@ -2069,10 +2002,11 @@ def analyze_and_execute():
 def main_loop():
     global FIRST_RUN
     
-    exchange = BinancePrivateExchange(API_KEY, API_SECRET, BASE_URL)
+    exchange = TrueTradePrivateExchange(API_KEY, API_SECRET, BASE_URL)
     last_daily_report_date = None
     last_monthly_report_date = None
 
+    # ★★★ اگر اولین بار است، یک بار Analyze را با FIRST_RUN=True اجرا کن ★★★
     if FIRST_RUN:
         logger.info("[MAIN_LOOP] اولین اجرا - پردازش فقط داده‌های جدید")
         analyze_and_execute()
@@ -2085,7 +2019,7 @@ def main_loop():
             analyze_and_execute()
 
             today = format_iran_date()
-            now = datetime.now(IRAN_TZ)
+            now = datetime.now(timezone(timedelta(hours=3, minutes=30)))
 
             if last_daily_report_date != today:
                 try:
@@ -2113,12 +2047,20 @@ def health():
     return "OK", 200
 
 # =====================================================================================
-# تحلیل ۲۴ ساعت اخیر
+# ★ قابلیت جدید: تحلیل ۲۴ ساعت اخیر بدون معامله (با خروجی TXT)
 # =====================================================================================
 def analyze_last_24h_and_send_report():
+    """
+    تحلیل ۲۴ ساعت اخیر، ذخیره سیگنال‌ها در فایل TXT و ارسال به تلگرام
+    فقط یک بار اجرا می‌شود و هیچ معامله‌ای انجام نمی‌دهد.
+    توجه: چون این تابع صرفاً گزارشی/تحلیلی است و هیچ معامله‌ای انجام نمی‌دهد،
+    detect_signal با allow_realtime_cross_trade=False فراخوانی می‌شود تا همه‌ی
+    تقاطع‌های طلایی/مرگِ کل بازه (نه فقط چند کندل آخر) در گزارش دیده شوند.
+    """
     logger.info("[ANALYZE_24H] شروع تحلیل ۲۴ ساعت اخیر...")
     
-    now = datetime.now(IRAN_TZ)
+    # ۱. تاریخ و ساعت فعلی
+    now = datetime.now(timezone(timedelta(hours=3, minutes=30)))
     now_str = now.strftime('%Y-%m-%d %H:%M:%S')
     cutoff_time = now - timedelta(hours=24)
     cutoff_str = cutoff_time.strftime('%Y-%m-%d %H:%M:%S')
@@ -2132,7 +2074,7 @@ def analyze_last_24h_and_send_report():
         f"━━━━━━━━━━━━━━━━━━━━━━"
     )
     
-    data = BinanceData()
+    data = TrueTradeData()
     all_signals = {}
     signal_count = 0
     
@@ -2140,20 +2082,27 @@ def analyze_last_24h_and_send_report():
         try:
             logger.info(f"[ANALYZE_24H] بررسی {symbol}...")
             
-            df_1m, _ = data.fetch_ohlcv(symbol, MAIN_TIMEFRAME, 1500)
-            df_5m, _ = data.fetch_ohlcv(symbol, SSL_TIMEFRAME, 300)
+            # دریافت داده‌های ۲۴ ساعت اخیر
+            df_1m = data.fetch_ohlcv(symbol, MAIN_TIMEFRAME, 1500)
+            df_5m = data.fetch_ohlcv(symbol, SSL_TIMEFRAME, 300)
             
             if df_1m is None or df_1m.empty:
                 logger.warning(f"[ANALYZE_24H] {symbol}: داده 1m نیست")
                 continue
             
+            # فیلتر ۲۴ ساعت اخیر
             df_1m = df_1m[df_1m.index >= cutoff_time].copy()
             
             if len(df_1m) < 120:
                 logger.warning(f"[ANALYZE_24H] {symbol}: داده ناکافی ({len(df_1m)} کندل)")
                 continue
             
+            # ایجاد state موقت (جدا از state اصلی)
             temp_state = SymbolState()
+            
+            # تشخیص سیگنال‌ها (با debug=False برای لاگ کمتر)
+            # allow_realtime_cross_trade=False چون این فقط یک گزارش تحلیلی است،
+            # نه اجرای لحظه‌ای/لایو — پس هیچ محدودیتی روی «تازگی» تقاطع لازم نیست.
             signals, _ = detect_signal(df_1m, df_5m, temp_state, symbol, debug=False,
                                         allow_realtime_cross_trade=False)
             
@@ -2161,16 +2110,22 @@ def analyze_last_24h_and_send_report():
                 all_signals[symbol] = signals
                 signal_count += len(signals)
                 logger.info(f"[ANALYZE_24H] {symbol}: {len(signals)} سیگنال یافت شد")
+                # ★★★ رفع اسپم: دیگر برای هر سیگنال پیام جدا به تلگرام ارسال نمی‌شود ★★★
+                # (باگ اصلی که واگرایی صفر تولید می‌کرد رفع شده، پس روی ۲۴ ساعت کامل
+                #  با تایم‌فریم ۱ دقیقه‌ای، ده‌ها/صدها پیوت معتبر پیدا می‌شود — ارسال
+                #  پیام جداگانه برای هرکدام غیرعملی است. جزئیات کامل هر سیگنال در همان
+                #  فایل TXK زیر ذخیره و به‌صورت یک فایل واحد به تلگرام ارسال می‌شود.)
             else:
                 logger.info(f"[ANALYZE_24H] {symbol}: هیچ سیگنالی یافت نشد")
                 
         except Exception as e:
             logger.error(f"[ANALYZE_24H] خطا در {symbol}: {e}")
     
-    # ذخیره در فایل TXT
+    # ۲. ذخیره در فایل TXT
     report_file = f"signals_24h_{now.strftime('%Y%m%d_%H%M%S')}.txt"
     try:
         with open(report_file, 'w', encoding='utf-8') as f:
+            # Header
             f.write("=" * 80 + "\n")
             f.write(f"📊 REPORT: 24-HOUR SIGNAL ANALYSIS\n")
             f.write("=" * 80 + "\n\n")
@@ -2183,6 +2138,7 @@ def analyze_last_24h_and_send_report():
             if signal_count == 0:
                 f.write("⚠️ هیچ سیگنالی در ۲۴ ساعت اخیر یافت نشد.\n")
             else:
+                # Signals by symbol
                 for symbol, signals in all_signals.items():
                     f.write(f"\n{'=' * 80}\n")
                     f.write(f"🔹 SYMBOL: {symbol}\n")
@@ -2194,6 +2150,7 @@ def analyze_last_24h_and_send_report():
                         dir_txt = "LONG" if direction == "BUY" else "SHORT"
                         dir_emoji = "🟢" if direction == "BUY" else "🔴"
                         
+                        # محاسبه سود/ضرر
                         entry = sig['entry']
                         stop = sig['stop']
                         target = sig['target']
@@ -2222,6 +2179,7 @@ def analyze_last_24h_and_send_report():
                         f.write(f"│ ⚖️ نسبت RR     : 1:{rr:.2f}\n")
                         f.write(f"└──────────────────────────────────────────\n\n")
             
+            # Footer
             f.write("-" * 80 + "\n")
             f.write(f"⚠️ این گزارش صرفاً جهت تحلیل است و هیچ معامله‌ای انجام نشده است.\n")
             f.write(f"🕒 {now_str}\n")
@@ -2232,9 +2190,10 @@ def analyze_last_24h_and_send_report():
         logger.error(f"[ANALYZE_24H] خطا در ذخیره فایل: {e}")
         report_file = None
 
-    # ارسال فایل به تلگرام
+  # ۳. ارسال فایل TXT به تلگرام
     if report_file and os.path.exists(report_file):
         try:
+            # ارسال فایل به تلگرام
             url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendDocument"
             with open(report_file, 'rb') as f:
                 files = {'document': (report_file, f, 'text/plain')}
@@ -2248,6 +2207,7 @@ def analyze_last_24h_and_send_report():
                 logger.info(f"[ANALYZE_24H] فایل گزارش به تلگرام ارسال شد")
             else:
                 logger.error(f"[ANALYZE_24H] خطا در ارسال فایل: {response.text[:200]}")
+                # اگر فایل ارسال نشد، محتوا را به صورت متن ارسال کن
                 try:
                     with open(report_file, 'r', encoding='utf-8') as f:
                         content = f.read()
@@ -2271,10 +2231,11 @@ def analyze_last_24h_and_send_report():
         except Exception as e:
             logger.error(f"[ANALYZE_24H] خطا در ارسال فایل به تلگرام: {e}")
     
+    # ۴. گزارش نهایی
     summary_msg = (
         f"✅ *تحلیل ۲۴ ساعت اخیر کامل شد* {HASHTAGS['diagnostic']}\n"
         f"━━━━━━━━━━━━━━━━━━━━━━\n"
-        f"📊 کل سیگنال‌های یافته شده: *{signal_count}*\n"
+        f"📊 کل سیگنال‌های یافت شده: *{signal_count}*\n"
         f"📁 فایل گزارش: `{report_file}`\n"
         f"━━━━━━━━━━━━━━━━━━━━━━\n"
         f"⚠️ *هیچ معامله‌ای انجام نشد*\n"
@@ -2285,24 +2246,90 @@ def analyze_last_24h_and_send_report():
     logger.info(f"[ANALYZE_24H] تحلیل کامل شد. {signal_count} سیگنال یافت شد.")
     return all_signals, signal_count
 
-# =====================================================================================
-# اجرای اصلی
-# =====================================================================================
-if __name__ == "__main__":
-    logger.info("DTM v6 FC Bot Starting... (نسخه ۵ — Binance + TrueTrade SL/TP)")
+
+
+  # ۳. ارسال فایل TXT به تلگرام
+    if report_file and os.path.exists(report_file):
+        try:
+            # ارسال فایل به تلگرام
+            url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendDocument"
+            with open(report_file, 'rb') as f:
+                files = {'document': (report_file, f, 'text/plain')}
+                data_payload = {
+                    'chat_id': TELEGRAM_CHAT_ID,
+                    'caption': f"📊 گزارش تحلیل ۲۴ ساعت اخیر\n📅 {now_str}\n📊 {signal_count} سیگنال یافت شد"
+                }
+                response = requests.post(url, files=files, data=data_payload, timeout=60)
+                
+            if response.status_code == 200:
+                logger.info(f"[ANALYZE_24H] فایل گزارش به تلگرام ارسال شد")
+            else:
+                logger.error(f"[ANALYZE_24H] خطا در ارسال فایل: {response.text[:200]}")
+                # اگر فایل ارسال نشد، محتوا را به صورت متن ارسال کن
+                try:
+                    with open(report_file, 'r', encoding='utf-8') as f:
+                        content = f.read()
+                    if len(content) > 4000:
+                        parts = [content[i:i+4000] for i in range(0, len(content), 4000)]
+                        for i, part in enumerate(parts):
+                            send_telegram_message(
+                                f"📄 *گزارش تحلیل (بخش {i+1}/{len(parts)})*\n"
+                                f"━━━━━━━━━━━━━━━━━━━━━━\n"
+                                f"```\n{part}\n```"
+                            )
+                    else:
+                        send_telegram_message(
+                            f"📄 *گزارش تحلیل ۲۴ ساعت اخیر*\n"
+                            f"━━━━━━━━━━━━━━━━━━━━━━\n"
+                            f"```\n{content}\n```"
+                        )
+                except Exception as e2:
+                    logger.error(f"[ANALYZE_24H] خطا در ارسال متن: {e2}")
+                    
+        except Exception as e:
+            logger.error(f"[ANALYZE_24H] خطا در ارسال فایل به تلگرام: {e}")
     
+    # ۴. گزارش نهایی
+    summary_msg = (
+        f"✅ *تحلیل ۲۴ ساعت اخیر کامل شد* {HASHTAGS['diagnostic']}\n"
+        f"━━━━━━━━━━━━━━━━━━━━━━\n"
+        f"📊 کل سیگنال‌های یافت شده: *{signal_count}*\n"
+        f"📁 فایل گزارش: `{report_file}`\n"
+        f"━━━━━━━━━━━━━━━━━━━━━━\n"
+        f"⚠️ *هیچ معامله‌ای انجام نشد*\n"
+        f"🕒 {now_str}"
+    )
+    send_telegram_message(summary_msg)
+    
+    logger.info(f"[ANALYZE_24H] تحلیل کامل شد. {signal_count} سیگنال یافت شد.")
+    return all_signals, signal_count
+
+                              
+if __name__ == "__main__":
+    logger.info("DTM v6 FC Bot Starting... (نسخه ۴ — Pine-Exact)")
+    
+    # ★ ارسال وضعیت SSL Hybrid در استارتاپ
     ssl_status_msg = compute_ssl_hybrid_status()
     send_telegram_message(ssl_status_msg)
     
+    # ★★★ رفع باگ اسپم روی هر ری‌استارت ★★★
+    # قبلاً reset_state_for_live_mode() روی هر بار اجرای برنامه (حتی کرش/دیپلوی
+    # ساده) کل پیوت‌ها و last_ma_ts را پاک می‌کرد؛ در نتیجه اسکن تقاطع
+    # طلایی/مرگ از صفر روی کل تاریخچه اجرا می‌شد و سیگنال‌های قدیمی دوباره
+    # پردازش/ثبت می‌شدند. طبق تصمیم شما، state اکنون بین ری‌استارت‌ها حفظ
+    # می‌شود (نه پاک) — فقط با ست کردن متغیر محیطی FORCE_RESET_STATE=1 می‌توان
+    # عمداً یک‌بار state را صفر کرد.
     if os.getenv("FORCE_RESET_STATE") == "1":
         logger.info("[STARTUP] FORCE_RESET_STATE=1 → ریست دستی state")
         reset_state_for_live_mode()
 
+    # بارگذاری state (در حالت عادی: state قبلی از دیسک بازیابی می‌شود)
     load_signal_counter()
     load_states()
 
     hashtag_list = "\n".join([f"• {v} → {k}" for k, v in HASHTAGS.items()])
 
+    # ★ اجرای تحلیل ۲۴ ساعت اخیر (فقط یک بار - قبل از معاملات اصلی)
     try:
         logger.info("[STARTUP] شروع تحلیل ۲۴ ساعت اخیر...")
         analyze_last_24h_and_send_report()
@@ -2316,15 +2343,17 @@ if __name__ == "__main__":
             f"🕒 {format_iran_time()}"
         )
 
+    # ★ بلوک ۳ — پیام استارتاپ
     send_telegram_message(
         f"🤖 *DTM v6·FC — آنلاین* {HASHTAGS['startup']}\n"
         f"━━━━━━━━━━━━━━━━━━━━━━\n"
         f"🧠 سیگنال‌ها: واگرایی کلاسیک(★)/مخفی + تقاطع طلایی/مرگ\n"
-        f"🔷 فیلتر SSL: {SSL_TIMEFRAME} تک‌تایم‌فریمی — فعال روی همه‌ی سیگنال‌ها\n"
-        f"⚙️ Pivot: {LEFT_BARS}/{RIGHT_BARS} | دو پیوت متوالی (Pine-exact)\n"
-        f"🛡️ استاپ/تارگت: **دقیقاً مطابق strategy_wrapper (R:R >= 2)**\n"
-        f"🛡️ ریسک‌فری خودکار: روی سطح ساختاری (structural_level)\n"
-        f"📡 دریافت داده: **بایننس** → تطبیق با دِتروترید\n"
+        f"🔷 فیلتر SSL: {SSL_TIMEFRAME} تک‌تایم‌فریمی — فعال روی همه‌ی سیگنال‌ها (مطابق Pine)\n"
+        f"⚙️ Pivot: {LEFT_BARS}/{RIGHT_BARS} | دو پیوت متوالی (Pine-exact) | تاریخچه: {HISTORY_BARS} کندل\n"
+        f"🛑 حد ضرر واگرایی: بیرون از دو پیوت + {STOP_BUFFER_TICKS} تیک (چند سنت ایمنی)\n"
+        f"🎯 حد سود: همیشه ریسک‌به‌ریوارد ثابت 1:{TARGET_RR:.0f}\n"
+        f"🛡️ ریسک‌فری خودکار: انتقال استاپ به سر‌به‌سر با رسیدن به 1R\n"
+        f"🔍 پیگیری با قیمت لحظه‌ای صرافی\n"
         f"━━━━━━━━━━━━━━━━━━━━━━\n"
         f"📌 هشتگ‌های ثابت:\n{hashtag_list}\n"
         f"━━━━━━━━━━━━━━━━━━━━━━\n"
@@ -2332,8 +2361,14 @@ if __name__ == "__main__":
         f"🕒 {format_iran_time()}"
     )
 
+    # ★ تنظیم FIRST_RUN = True قبل از شروع
     FIRST_RUN = True
+    
+    # اجرای تشخیص اولیه
     run_startup_diagnostic()
     
+    # شروع سرور Flask (برای health check)
     threading.Thread(target=lambda: app.run(host="0.0.0.0", port=10000), daemon=True).start()
+    
+    # شروع حلقه اصلی
     main_loop()
