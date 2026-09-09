@@ -142,7 +142,7 @@ HASHTAGS = {
 # ★ بلوک ۱ — ثابت‌ها (جایگزین خطوط ~۸۸ تا ۱۳۵)
 # =====================================================================================
 LEFT_BARS = 5
-RIGHT_BARS = 2               # ★ Pine: i_pr = 1 (قبلاً ۲ بود)
+RIGHT_BARS = 2                # ✅ باید دقیقاً برابر «پیوت راست» (i_pr) در ورودی‌های اندیکاتور پاین باشد
 
 RSI_LEN = 14
 MACD_FAST, MACD_SLOW, MACD_SIGNAL = 12, 26, 9
@@ -743,6 +743,68 @@ def compute_ssl_hlv(df_5m):
         send_telegram_message(error_msg)
         return None
 
+def compute_ssl_hlv_series(df_5m):
+    """
+    ★ نسخه‌ی سری‌زمانیِ SSL Hybrid — مخصوص گیت دقیق per-bar روی رویدادهای
+    تقاطع طلایی/مرگ (Golden/Death Cross).
+
+    چرا لازم است؟
+    در پاین، gate_long/gate_short با request.security(..., Hlv[1], lookahead_on)
+    محاسبه می‌شود که یعنی: «به‌ازای هر کندل ۱ دقیقه‌ای، آخرین کندل ۵ دقیقه‌ایِ
+    کاملاً بسته‌شده تا همان لحظه». این یعنی گیت SSL یک مقدار *تاریخی و
+    وابسته به لحظه‌ی دقیق تقاطع* است، نه یک مقدار واحدِ «همین الان».
+
+    نسخه‌ی قبلی (compute_ssl_hlv) فقط آخرین مقدار hlv را برمی‌گرداند و همان
+    یک مقدار به همه‌ی رویدادهای MA-cross پیدا شده در یک اجرا (که ممکن است
+    چند کندل قبل رخ داده باشند — مثلاً بعد از ری‌استارت ربات یا Catch-up)
+    اعمال می‌شود. این می‌تواند در حالت Catch-up باعث عدم تطابق دقیق با پاین شود.
+
+    خروجی: (hlv_index: DatetimeIndex هم‌طول df_5m, hlv_array: np.array) یا (None, None)
+    """
+    global SSL_AVAILABLE
+    if df_5m is None or len(df_5m) < SSL_BASELINE_LEN + 5 or not SSL_AVAILABLE:
+        return None, None
+    try:
+        data = {
+            'open': df_5m['open'].values,
+            'high': df_5m['high'].values,
+            'low': df_5m['low'].values,
+            'close': df_5m['close'].values,
+            'volume': df_5m['volume'].values if 'volume' in df_5m else None
+        }
+        result = ssl_hybrid_indicator(data)
+        hlv = result.get('hlv')
+        if hlv is None or not hasattr(hlv, '__len__'):
+            return None, None
+        return df_5m.index, np.asarray(hlv)
+    except Exception as e:
+        logger.error(f"[SSL-SERIES] Error: {e}")
+        return None, None
+
+
+def get_hlv_at_ts(hlv_index, hlv_array, event_ts):
+    """
+    معادل دقیق «آخرین کندل ۵ دقیقه‌ایِ بسته‌شده تا لحظه‌ی رویداد» —
+    یعنی همان چیزی که Hlv[1] از طریق request.security(lookahead_on) در پاین
+    برمی‌گرداند. اگر داده‌ی سری‌زمانی در دسترس نباشد، None برمی‌گرداند تا
+    فراخواننده بتواند به مقدار fallback (آخرین hlv شناخته‌شده) برگردد.
+    """
+    if hlv_index is None or hlv_array is None or event_ts is None:
+        return None
+    ts = pd.Timestamp(event_ts)
+    if ts.tzinfo is None:
+        ts = ts.tz_localize('UTC')
+    else:
+        ts = ts.tz_convert('UTC')
+    pos = hlv_index.searchsorted(ts, side='right') - 1
+    if pos < 0 or pos >= len(hlv_array):
+        return None
+    val = hlv_array[pos]
+    if pd.isna(val):
+        return None
+    return int(val)
+
+
 def compute_ssl_hybrid_status():
     """گزارش وضعیت SSL Hybrid برای نمایش در استارتاپ"""
     if SSL_AVAILABLE:
@@ -1248,24 +1310,41 @@ def detect_signal(df_1m, df_5m, state, symbol, debug=False):
     new_classic_bear_candidates = []
     cross_signals = []
 
-    # تقاطع طلایی/مرگ (با گیت SSL — مثل Pine)
+    # ─────────────────────────────────────────────────────────────────
+    # ★★★ گیت SSL دقیقِ per-bar برای تقاطع طلایی/مرگ ★★★
+    # به‌جای اعمال یک مقدار «فعلی» hlv به همه‌ی رویدادهای این batch،
+    # مقدار SSL را دقیقاً در همان لحظه‌ی هر تقاطع (Hlv[1] معادل پاین)
+    # می‌خوانیم. اگر سری‌زمانی در دسترس نبود، به مقدار scalar فعلی
+    # (رفتار قبلی) به‌عنوان fallback برمی‌گردیم تا هیچ سیگنالی از دست نرود.
+    # ─────────────────────────────────────────────────────────────────
+    hlv_index, hlv_array = compute_ssl_hlv_series(df_5m)
+
+    # تقاطع طلایی/مرگ (با گیت SSL دقیق per-bar — مثل Pine)
     for etype, ets in ma_events:
-        if etype == "BUY_CROSS" and gate_long:
+        hlv_evt = get_hlv_at_ts(hlv_index, hlv_array, ets)
+        if hlv_evt is None:
+            hlv_evt = hlv  # fallback به آخرین مقدار شناخته‌شده
+        gate_long_evt = hlv_evt == 1
+        gate_short_evt = hlv_evt == -1
+
+        if etype == "BUY_CROSS" and gate_long_evt:
             stop, target = compute_cross_sl_tp("long", entry_price, atr_now)
             cross_signals.append({
                 'type': 'GOLDEN_CROSS', 'direction': 'BUY',
                 'entry': entry_price, 'stop': stop, 'target': target,
                 'extra': "⬆تقاطع طلایی", 'score': 0, 'time': format_iran_time(ets)
             })
-            log(f"   ⬆️ Golden Cross @ {ets}")
-        elif etype == "SELL_CROSS" and gate_short:
+            log(f"   ⬆️ Golden Cross @ {ets} | Hlv(event)={hlv_evt}")
+        elif etype == "SELL_CROSS" and gate_short_evt:
             stop, target = compute_cross_sl_tp("short", entry_price, atr_now)
             cross_signals.append({
                 'type': 'DEATH_CROSS', 'direction': 'SELL',
                 'entry': entry_price, 'stop': stop, 'target': target,
                 'extra': "⬇تقاطع مرگ", 'score': 0, 'time': format_iran_time(ets)
             })
-            log(f"   ⬇️ Death Cross @ {ets}")
+            log(f"   ⬇️ Death Cross @ {ets} | Hlv(event)={hlv_evt}")
+        elif etype in ("BUY_CROSS", "SELL_CROSS"):
+            log(f"   ⛔ {etype} @ {ets} رد شد — Hlv(event)={hlv_evt} با گیت هم‌جهت نیست")
 
     # ------------------------------------------------------------------
     # ★★★ واگرایی نزولی — روی هر پیوت جدید (نه فقط آخرین) ★★★
@@ -2152,3 +2231,4 @@ if __name__ == "__main__":
     
     # شروع حلقه اصلی
     main_loop()
+
