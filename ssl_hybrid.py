@@ -313,10 +313,11 @@ def _hold_state(cond_up: pd.Series, cond_down: pd.Series) -> pd.Series:
 def main(
     data: dict,
     *,
-    maType: str = "HMA", len_: int = 60,
-    SSL2Type: str = "JMA", len2: int = 5, atr_crit: float = 0.9,
-    SSL3Type: str = "HMA", len3: int = 15,
-    atrlen: int = 14, mult: float = 1.0, smoothing: str = "WMA",
+    # ★ مقادیر پیش‌فرض دقیقاً مطابق تنظیمات واقعی شما در TradingView (DTM·v6·FC)
+    maType: str = "HMA", len_: int = 34,
+    SSL2Type: str = "JMA", len2: int = 5, atr_crit: float = 1.2,
+    SSL3Type: str = "HMA", len3: int = 21,
+    atrlen: int = 14, mult: float = 1.5, smoothing: str = "WMA",
     multy: float = 0.2, useTrueRange: bool = True,
     risk_lookback: int = 100, risk_sensitivity: float = 2.0,
     enable_risk_gradient: bool = True,
