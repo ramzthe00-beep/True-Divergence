@@ -12,6 +12,10 @@ DTM v6 FC — Divergence + Golden/Death Cross Signal Bot   (نسخه ۴ — Pine
 + **ENHANCED**: Multi-Pivot Comparison for 1m timeframe
   (compare new pivot with multiple previous pivots, min/max bar distance filters)
 + **DEBUG**: Full Debug Log in file
++ **FIX (این نسخه)**: تقاطع طلایی/مرگ دیگر روی داده‌های قدیمی (Catch-up بعد از
+  ری‌استارت/گپ) معامله نمی‌کند — فقط تقاطعِ واقعاً تازه (چند کندل آخر) سیگنال/معامله
+  می‌شود؛ گیت SSL هم دقیقاً در همان لحظه‌ی تقاطع خوانده می‌شود — همان لحظه‌ای که
+  پاین برچسب را روی چارت رسم می‌کند.
 ------------------------------------------------------------------
 🆕 تغییرات نسخه ۴ (به درخواست کاربر):
   • RIGHT_BARS = 1 (i_pr=1) — مطابق Pine
@@ -179,6 +183,16 @@ SSL_BASELINE_LEN = 34
 MAIN_TIMEFRAME = "1m"
 
 CROSS_ATR_STOP_MULT = 2.0
+
+# ★★★ FIX #1 — جلوگیری از معامله روی تقاطع‌های طلایی/مرگِ قدیمی ★★★
+# اگر بعد از ری‌استارت/گپ در داده/خالی بودن state، مجبور به Catch-up (پردازش
+# بازه‌ی بزرگی از کندل‌های گذشته) شویم، هر تقاطعی که در آن بازه پیدا شود
+# «به لحاظ ریاضی» درست است، اما دیگر واقعاً «تازه» نیست و نباید معامله شود.
+# این ثابت مشخص می‌کند که فقط تقاطع‌های واقع در همین چند کندل آخر (نزدیک به
+# لحظه‌ی اجرای فعلی ربات) به‌عنوان سیگنال/معامله در نظر گرفته شوند؛ تقاطع‌های
+# قدیمی‌تر فقط برای صحتِ داخلیِ وضعیت رست (rst_l/rst_s) پردازش می‌شوند و هیچ
+# سیگنال/معامله‌ای از آن‌ها صادر نمی‌شود.
+MAX_CROSS_EMIT_LOOKBACK_BARS = 2
 
 TICK_SIZES = {"LTCUSDT": 0.01, "DOGEUSDT": 0.00001, "ETHUSDT": 0.01}
 PRICE_PRECISION = {"LTCUSDT": 2, "DOGEUSDT": 5, "ETHUSDT": 2}
@@ -1008,6 +1022,9 @@ class SymbolState:
                           'hist': p.get('hist', 0), 'bar': p.get('bar', 0)}
                          for p in self.pivot_lows[-200:]],
             'last_processed_ts': str(self.last_processed_ts) if self.last_processed_ts else None,
+            'rst_l': self.rst_l,
+            'rst_s': self.rst_s,
+            'last_ma_ts': str(self.last_ma_ts) if self.last_ma_ts else None,
             'telegram_log_count': self.telegram_log_count,
             'last_telegram_log_time': self.last_telegram_log_time,
             'pending_bull_divs': _pending_to_dict(self.pending_bull_divs),
@@ -1027,6 +1044,9 @@ class SymbolState:
                                 'hist': p.get('hist', 0), 'bar': p.get('bar', 0)}
                                for p in data.get('pivot_lows', [])]
             state.last_processed_ts = pd.Timestamp(data['last_processed_ts']) if data.get('last_processed_ts') else None
+            state.rst_l = data.get('rst_l', False)
+            state.rst_s = data.get('rst_s', False)
+            state.last_ma_ts = pd.Timestamp(data['last_ma_ts']) if data.get('last_ma_ts') else None
             state.telegram_log_count = data.get('telegram_log_count', 0)
             state.last_telegram_log_time = data.get('last_telegram_log_time', 0)
 
@@ -1112,8 +1132,26 @@ def load_signal_counter():
 # =====================================================================================
 # تقاطع طلایی/مرگ
 # =====================================================================================
-def process_ma_crosses(closed_df_indexed, ma_f, ma_m, ma_s, state, start_bar, end_bar):
+def process_ma_crosses(closed_df_indexed, ma_f, ma_m, ma_s, state, start_bar, end_bar, emit_from_bar=None):
+    """
+    محاسبه‌ی تقاطع طلایی/مرگ — دقیقاً بار‌به‌بار مطابق منطق پاین
+    (rst_l/rst_s + crossover/crossunder ma_f روی ma_m، هم‌جهت با ma_s).
+
+    ★★★ FIX — جلوگیری از معامله روی تقاطع‌های قدیمی (Catch-up) ★★★
+    این تابع کل بازه‌ی [start_bar..end_bar] را — همان‌طور که پاین بار به بار
+    انجام می‌دهد — پردازش می‌کند تا وضعیت‌های rst_l/rst_s همیشه صحیح و
+    پیوسته باقی بمانند (این بخش دست‌نخورده و کاملاً Pine-Exact است).
+    اما رویداد (event) فقط برای بارهایی برگردانده می‌شود که
+    `i >= emit_from_bar` باشد — یعنی فقط تقاطع‌های واقعاً «تازه» (نزدیک به
+    لحظه‌ی فعلی اجرای ربات). اگر بعد از ری‌استارت/گپ در داده مجبور به
+    Catch-up روی بازه‌ی بزرگی از کندل‌های گذشته شویم، تقاطع‌های قدیمی‌تر از
+    emit_from_bar فقط باعث به‌روزرسانی صحیح rst_l/rst_s می‌شوند و هرگز
+    سیگنال/معامله تولید نمی‌کنند.
+    اگر emit_from_bar=None باشد، همه‌ی رویدادها برگردانده می‌شوند (رفتار قدیم،
+    مثلاً برای گزارش تحلیلی ۲۴ ساعته که قرار نیست معامله‌ای انجام دهد).
+    """
     events = []
+    skipped_old = 0
     for i in range(max(1, start_bar), end_bar + 1):
         f_now, f_prev = ma_f.iloc[i], ma_f.iloc[i-1]
         m_now, m_prev = ma_m.iloc[i], ma_m.iloc[i-1]
@@ -1130,11 +1168,17 @@ def process_ma_crosses(closed_df_indexed, ma_f, ma_m, ma_s, state, start_bar, en
         gc_s = xdn and f_now < s_now and state.rst_s
         if gc_l:
             state.rst_l = False
-            events.append(("BUY_CROSS", closed_df_indexed.index[i]))
+            if emit_from_bar is None or i >= emit_from_bar:
+                events.append(("BUY_CROSS", closed_df_indexed.index[i]))
+            else:
+                skipped_old += 1
         if gc_s:
             state.rst_s = False
-            events.append(("SELL_CROSS", closed_df_indexed.index[i]))
-    return events
+            if emit_from_bar is None or i >= emit_from_bar:
+                events.append(("SELL_CROSS", closed_df_indexed.index[i]))
+            else:
+                skipped_old += 1
+    return events, skipped_old
 
 # =====================================================================================
 # تابع ذخیره لاگ در فایل
@@ -1156,7 +1200,14 @@ def save_debug_log_to_file(symbol, debug_log_lines):
 # =====================================================================================
 # ★ بلوک ۲ — کل تابع detect_signal (جایگزین از def detect_signal تا قبل از def track_open_signals)
 # =====================================================================================
-def detect_signal(df_1m, df_5m, state, symbol, debug=False):
+def detect_signal(df_1m, df_5m, state, symbol, debug=False, allow_realtime_cross_trade=True):
+    """
+    allow_realtime_cross_trade=True   → حالت عادی (لحظه‌ای/لایو): فقط تقاطع طلایی/مرگِ
+                                         واقعاً تازه (چند کندل آخر) سیگنال/معامله می‌شود.
+    allow_realtime_cross_trade=False  → حالت تحلیلی/گزارشی (مثل analyze_last_24h)، که
+                                         قرار نیست معامله‌ای انجام دهد و صرفاً می‌خواهد
+                                         همه‌ی تقاطع‌های بازه را ببیند.
+    """
     debug_log = []
     debug_file_lines = []
     def log(msg):
@@ -1277,6 +1328,7 @@ def detect_signal(df_1m, df_5m, state, symbol, debug=False):
     # تقاطع طلایی / مرگ
     # ------------------------------------------------------------------
     ma_start_pos = 1
+    ma_fallback_used = False
     if state.last_ma_ts is not None and state.last_ma_ts in closed_df_indexed.index:
         try:
             ma_start_pos = max(1, closed_df_indexed.index.get_loc(state.last_ma_ts))
@@ -1284,8 +1336,31 @@ def detect_signal(df_1m, df_5m, state, symbol, debug=False):
                 ma_start_pos = ma_start_pos.start if ma_start_pos.start is not None else 1
         except:
             ma_start_pos = 1
+            ma_fallback_used = True
+    else:
+        ma_fallback_used = True
 
-    ma_events = process_ma_crosses(closed_df_indexed, ma_f, ma_m, ma_s, state, ma_start_pos, n - 1)
+    # ★★★ FIX #1 — جلوگیری از معامله روی تقاطع‌های طلایی/مرگِ قدیمی (Catch-up) ★★★
+    # کل بازه‌ی [ma_start_pos..n-1] همچنان بار به بار پردازش می‌شود تا rst_l/rst_s
+    # همیشه صحیح باقی بمانند (دقیقاً مثل پاین)، اما «سیگنال/معامله» فقط برای
+    # تقاطع‌هایی صادر می‌شود که در همین چند کندل آخر (MAX_CROSS_EMIT_LOOKBACK_BARS)
+    # اتفاق افتاده باشند — یعنی همان لحظه‌ای که واقعاً روی چارت زنده رخ می‌دهد،
+    # نه لحظه‌ای که ربات به‌خاطر ری‌استارت/گپ به آن رسیده است.
+    # در حالت گزارش تحلیلی (allow_realtime_cross_trade=False) این محدودیت اعمال
+    # نمی‌شود چون قرار نیست معامله‌ای صورت بگیرد.
+    emit_from_bar = None
+    if allow_realtime_cross_trade:
+        emit_from_bar = max(1, (n - 1) - MAX_CROSS_EMIT_LOOKBACK_BARS)
+        if ma_fallback_used:
+            log(f"   ⚠️ last_ma_ts نامعتبر/خالی بود — Catch-up انجام می‌شود اما فقط تقاطع‌های {MAX_CROSS_EMIT_LOOKBACK_BARS} کندل اخیر سیگنال/معامله می‌شوند")
+        elif ma_start_pos < emit_from_bar - 1:
+            log(f"   ⚠️ فاصله‌ی زیاد بین last_ma_ts و اکنون — تقاطع‌های قدیمی‌تر از کندل {emit_from_bar} فقط برای rst_l/rst_s پردازش می‌شوند")
+
+    ma_events, ma_skipped_old = process_ma_crosses(
+        closed_df_indexed, ma_f, ma_m, ma_s, state, ma_start_pos, n - 1, emit_from_bar=emit_from_bar
+    )
+    if ma_skipped_old:
+        log(f"   ⏮️ {ma_skipped_old} تقاطع طلایی/مرگ قدیمی (Catch-up) نادیده گرفته شد — فقط rst_l/rst_s بروزرسانی شد، معامله‌ای صورت نگرفت")
     state.last_ma_ts = closed_df_indexed.index[n - 1]
 
     # ------------------------------------------------------------------
@@ -1314,8 +1389,9 @@ def detect_signal(df_1m, df_5m, state, symbol, debug=False):
     # ★★★ گیت SSL دقیقِ per-bar برای تقاطع طلایی/مرگ ★★★
     # به‌جای اعمال یک مقدار «فعلی» hlv به همه‌ی رویدادهای این batch،
     # مقدار SSL را دقیقاً در همان لحظه‌ی هر تقاطع (Hlv[1] معادل پاین)
-    # می‌خوانیم. اگر سری‌زمانی در دسترس نبود، به مقدار scalar فعلی
-    # (رفتار قبلی) به‌عنوان fallback برمی‌گردیم تا هیچ سیگنالی از دست نرود.
+    # می‌خوانیم — یعنی همان مقداری که پاین در لحظه‌ی رسم برچسب روی چارت
+    # از آن استفاده می‌کند. اگر سری‌زمانی در دسترس نبود، به مقدار scalar
+    # فعلی (رفتار قبلی) به‌عنوان fallback برمی‌گردیم تا هیچ سیگنالی از دست نرود.
     # ─────────────────────────────────────────────────────────────────
     hlv_index, hlv_array = compute_ssl_hlv_series(df_5m)
 
@@ -1748,7 +1824,8 @@ def analyze_and_execute():
 
             logger.info(f"[DATA] {symbol}: 1m={len(df_1m)} کندل")
 
-            signals, _ = detect_signal(df_1m, df_5m, SYMBOL_STATES[symbol], symbol, debug=True)
+            signals, _ = detect_signal(df_1m, df_5m, SYMBOL_STATES[symbol], symbol, debug=True,
+                                        allow_realtime_cross_trade=True)
 
             # ★★★ اگر اولین بار اجراست، فقط ۲ سیگنال آخر (جدیدترین) رو بگیر ★★★
             if FIRST_RUN and len(signals) > 2:
@@ -1975,7 +2052,10 @@ def health():
 def analyze_last_24h_and_send_report():
     """
     تحلیل ۲۴ ساعت اخیر، ذخیره سیگنال‌ها در فایل TXT و ارسال به تلگرام
-    فقط یک بار اجرا می‌شود و هیچ معامله‌ای انجام نمی‌دهد
+    فقط یک بار اجرا می‌شود و هیچ معامله‌ای انجام نمی‌دهد.
+    توجه: چون این تابع صرفاً گزارشی/تحلیلی است و هیچ معامله‌ای انجام نمی‌دهد،
+    detect_signal با allow_realtime_cross_trade=False فراخوانی می‌شود تا همه‌ی
+    تقاطع‌های طلایی/مرگِ کل بازه (نه فقط چند کندل آخر) در گزارش دیده شوند.
     """
     logger.info("[ANALYZE_24H] شروع تحلیل ۲۴ ساعت اخیر...")
     
@@ -2021,7 +2101,10 @@ def analyze_last_24h_and_send_report():
             temp_state = SymbolState()
             
             # تشخیص سیگنال‌ها (با debug=False برای لاگ کمتر)
-            signals, _ = detect_signal(df_1m, df_5m, temp_state, symbol, debug=False)
+            # allow_realtime_cross_trade=False چون این فقط یک گزارش تحلیلی است،
+            # نه اجرای لحظه‌ای/لایو — پس هیچ محدودیتی روی «تازگی» تقاطع لازم نیست.
+            signals, _ = detect_signal(df_1m, df_5m, temp_state, symbol, debug=False,
+                                        allow_realtime_cross_trade=False)
             
             if signals:
                 all_signals[symbol] = signals
@@ -2106,8 +2189,8 @@ def analyze_last_24h_and_send_report():
     except Exception as e:
         logger.error(f"[ANALYZE_24H] خطا در ذخیره فایل: {e}")
         report_file = None
-    
-    # ۳. ارسال فایل TXT به تلگرام
+
+  # ۳. ارسال فایل TXT به تلگرام
     if report_file and os.path.exists(report_file):
         try:
             # ارسال فایل به تلگرام
@@ -2164,6 +2247,64 @@ def analyze_last_24h_and_send_report():
     return all_signals, signal_count
 
 
+
+  # ۳. ارسال فایل TXT به تلگرام
+    if report_file and os.path.exists(report_file):
+        try:
+            # ارسال فایل به تلگرام
+            url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendDocument"
+            with open(report_file, 'rb') as f:
+                files = {'document': (report_file, f, 'text/plain')}
+                data_payload = {
+                    'chat_id': TELEGRAM_CHAT_ID,
+                    'caption': f"📊 گزارش تحلیل ۲۴ ساعت اخیر\n📅 {now_str}\n📊 {signal_count} سیگنال یافت شد"
+                }
+                response = requests.post(url, files=files, data=data_payload, timeout=60)
+                
+            if response.status_code == 200:
+                logger.info(f"[ANALYZE_24H] فایل گزارش به تلگرام ارسال شد")
+            else:
+                logger.error(f"[ANALYZE_24H] خطا در ارسال فایل: {response.text[:200]}")
+                # اگر فایل ارسال نشد، محتوا را به صورت متن ارسال کن
+                try:
+                    with open(report_file, 'r', encoding='utf-8') as f:
+                        content = f.read()
+                    if len(content) > 4000:
+                        parts = [content[i:i+4000] for i in range(0, len(content), 4000)]
+                        for i, part in enumerate(parts):
+                            send_telegram_message(
+                                f"📄 *گزارش تحلیل (بخش {i+1}/{len(parts)})*\n"
+                                f"━━━━━━━━━━━━━━━━━━━━━━\n"
+                                f"```\n{part}\n```"
+                            )
+                    else:
+                        send_telegram_message(
+                            f"📄 *گزارش تحلیل ۲۴ ساعت اخیر*\n"
+                            f"━━━━━━━━━━━━━━━━━━━━━━\n"
+                            f"```\n{content}\n```"
+                        )
+                except Exception as e2:
+                    logger.error(f"[ANALYZE_24H] خطا در ارسال متن: {e2}")
+                    
+        except Exception as e:
+            logger.error(f"[ANALYZE_24H] خطا در ارسال فایل به تلگرام: {e}")
+    
+    # ۴. گزارش نهایی
+    summary_msg = (
+        f"✅ *تحلیل ۲۴ ساعت اخیر کامل شد* {HASHTAGS['diagnostic']}\n"
+        f"━━━━━━━━━━━━━━━━━━━━━━\n"
+        f"📊 کل سیگنال‌های یافت شده: *{signal_count}*\n"
+        f"📁 فایل گزارش: `{report_file}`\n"
+        f"━━━━━━━━━━━━━━━━━━━━━━\n"
+        f"⚠️ *هیچ معامله‌ای انجام نشد*\n"
+        f"🕒 {now_str}"
+    )
+    send_telegram_message(summary_msg)
+    
+    logger.info(f"[ANALYZE_24H] تحلیل کامل شد. {signal_count} سیگنال یافت شد.")
+    return all_signals, signal_count
+
+                              
 if __name__ == "__main__":
     logger.info("DTM v6 FC Bot Starting... (نسخه ۴ — Pine-Exact)")
     
