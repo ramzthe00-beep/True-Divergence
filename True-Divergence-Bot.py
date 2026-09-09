@@ -155,6 +155,11 @@ MA_FAST_LEN, MA_MID_LEN, MA_SLOW_LEN = 7, 25, 99
 FIB_TOLERANCE_PCT = 1.5
 MIN_CLASSIC_SCORE = 1           # ★ هر واگرایی با ستاره = سیگنال (مطابق برچسب Pine)
 
+# ★★★ نیاز به کندل تأییدیه (Hammer/Shooting Star) تا ۳ کندل بعد از واگرایی کلاسیک ★★★
+# مطابق i_req_pa_conf که در عکس تنظیمات تیک خورده (فقط روی واگرایی کلاسیک؛ مخفی گیت نمی‌شود — مطابق Pine)
+REQUIRE_PA_CONFIRMATION = True
+WAIT_BARS_PA_CONFIRM = 3
+
 STOP_ATR_BUFFER = 0.1           # فقط برای تقاطع طلایی/مرگ
 TARGET_RR = 3.0                 # ⚖️ ریسک به ریوارد = ۳
 
@@ -474,9 +479,21 @@ def send_telegram_message(message: str) -> bool:
 send_telegram = send_telegram_message
 send_telegram_long = send_telegram_message
 
+IRAN_TZ = timezone(timedelta(hours=3, minutes=30))
+
 def format_iran_time(dt=None):
+    """
+    ✅ فیکس: اگر dt با تایم‌زون دیگری (مثلاً UTC از pandas) داده شود،
+    قبل از فرمت‌دهی به وقت ایران تبدیل می‌شود (قبلاً این تبدیل انجام نمی‌شد).
+    """
     if dt is None:
-        dt = datetime.now(timezone(timedelta(hours=3, minutes=30)))
+        dt = datetime.now(IRAN_TZ)
+    else:
+        if isinstance(dt, pd.Timestamp):
+            dt = dt.to_pydatetime()
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        dt = dt.astimezone(IRAN_TZ)
     return dt.strftime('%Y-%m-%d %H:%M:%S')
 
 def format_iran_date(dt=None):
@@ -789,6 +806,43 @@ def check_hammer(df, pivot_bar):
     return rng > 0 and w_bot >= body * 2.0 and w_bot >= w_top * 2.0 and body < rng * 0.4
 
 # =====================================================================================
+# ★★★ پردازش صف واگرایی‌های در انتظار کندل تأییدیه (Hammer/Shooting Star) ★★★
+#   مطابق i_req_pa_conf پاین: تا WAIT_BARS_PA_CONFIRM کندل بعد از تشکیل واگرایی
+#   کلاسیک، اگر کندل تأییدی روی «کندل جاری» (نه لزوماً پیوت) ظاهر شود، سیگنال
+#   نهایی می‌شود؛ در غیر این‌صورت پس از اتمام مهلت حذف می‌شود.
+#   چون ممکن است مهلت به کندل‌های بعد از پنجره‌ی فعلی کشیده شود، این صف در
+#   state ذخیره و بین فراخوانی‌های بعدی (و ری‌استارت‌ها، چون state پرسیست است)
+#   حفظ می‌شود.
+# =====================================================================================
+def process_pending_confirmations(closed_df_indexed, closed_df, pending_list, log_fn):
+    finalized = []
+    still_pending = []
+    idx = closed_df_indexed.index
+    for cand in pending_list:
+        start_ts = cand['confirm_start_ts']
+        deadline_ts = cand['deadline_ts']
+        mask = (idx >= start_ts) & (idx <= deadline_ts)
+        positions = np.where(mask)[0]
+        found = False
+        for wpos in positions:
+            ok = check_hammer(closed_df, wpos) if cand['direction'] == 'long' else check_shooting_star(closed_df, wpos)
+            if ok:
+                sig = dict(cand['signal'])
+                confirm_ts = idx[wpos]
+                sig['confirm_time'] = format_iran_time(confirm_ts)
+                finalized.append(sig)
+                log_fn(f"   ✅ کندل تأییدیه دریافت شد برای {sig['type']} @ {format_iran_time(confirm_ts)}")
+                found = True
+                break
+        if found:
+            continue
+        if len(idx) > 0 and idx[-1] >= deadline_ts:
+            log_fn(f"   ⌛ مهلت {WAIT_BARS_PA_CONFIRM} کندلی بدون تأییدیه به پایان رسید — {cand['signal']['type']} حذف شد")
+            continue
+        still_pending.append(cand)
+    return finalized, still_pending
+
+# =====================================================================================
 # Helper: Check bar distance between two pivots
 # =====================================================================================
 def check_bar_distance(bar1, bar2):
@@ -859,8 +913,20 @@ class SymbolState:
         self.last_ma_ts = None
         self.telegram_log_count = 0
         self.last_telegram_log_time = 0
+        # ★★★ واگرایی‌های کلاسیکی که منتظر کندل تأییدیه (Hammer/Shooting Star) هستند ★★★
+        self.pending_bull_divs = []   # هر آیتم: {'signal':dict, 'confirm_start_ts':Timestamp, 'deadline_ts':Timestamp, 'direction':'long'}
+        self.pending_bear_divs = []   # مشابه برای شورت
 
     def to_dict(self):
+        def _pending_to_dict(lst):
+            out = []
+            for c in lst:
+                cc = dict(c)
+                cc['confirm_start_ts'] = str(c['confirm_start_ts'])
+                cc['deadline_ts'] = str(c['deadline_ts'])
+                out.append(cc)
+            return out
+
         return {
             'pivot_highs': [{'ts': str(p['ts']), 'price': p['price'],
                            'rsi': p.get('rsi', 0), 'macdline': p.get('macdline', 0),
@@ -872,7 +938,9 @@ class SymbolState:
                          for p in self.pivot_lows[-200:]],
             'last_processed_ts': str(self.last_processed_ts) if self.last_processed_ts else None,
             'telegram_log_count': self.telegram_log_count,
-            'last_telegram_log_time': self.last_telegram_log_time
+            'last_telegram_log_time': self.last_telegram_log_time,
+            'pending_bull_divs': _pending_to_dict(self.pending_bull_divs),
+            'pending_bear_divs': _pending_to_dict(self.pending_bear_divs),
         }
 
     @classmethod
@@ -890,6 +958,18 @@ class SymbolState:
             state.last_processed_ts = pd.Timestamp(data['last_processed_ts']) if data.get('last_processed_ts') else None
             state.telegram_log_count = data.get('telegram_log_count', 0)
             state.last_telegram_log_time = data.get('last_telegram_log_time', 0)
+
+            def _pending_from_dict(lst):
+                out = []
+                for c in lst:
+                    cc = dict(c)
+                    cc['confirm_start_ts'] = pd.Timestamp(c['confirm_start_ts'])
+                    cc['deadline_ts'] = pd.Timestamp(c['deadline_ts'])
+                    out.append(cc)
+                return out
+
+            state.pending_bull_divs = _pending_from_dict(data.get('pending_bull_divs', []))
+            state.pending_bear_divs = _pending_from_dict(data.get('pending_bear_divs', []))
         return state
 
 SYMBOL_STATES = {s: SymbolState() for s in SYMBOLS}
@@ -1049,53 +1129,78 @@ def detect_signal(df_1m, df_5m, state, symbol, debug=False):
     pivot_low = find_pivot_low(low, LEFT_BARS, RIGHT_BARS)
 
     # ------------------------------------------------------------------
-    # پیوت تأییدشده (Pine-exact: bar_index - i_pr)
+    # ★★★ رفع باگ اصلی: Replay کامل روی کل بازه‌ی جدید ★★★
+    #   نسخه‌ی قبلی فقط «یک نقطه‌ی واحد» (real_pivot_candidate = last - RIGHT_BARS)
+    #   را چک می‌کرد؛ یعنی اگر بین دو فراخوانی حتی یک کندل جا می‌ماند (یا در
+    #   گزارش ۲۴h که state همیشه خالی است) پیوت‌ها هرگز به ۲ عدد نمی‌رسیدند و
+    #   واگرایی از نظر ریاضی غیرممکن بود. حالا از آخرین جایی که پردازش شده
+    #   (last_processed_ts) — یا از ابتدای بازه در صورت نبود state — تا آخرین
+    #   پیوت ممکن حلقه می‌زنیم؛ دقیقاً مثل رفتار بار-به-بار Pine.
     # ------------------------------------------------------------------
     last = n - 1
-    real_pivot_candidate = last - RIGHT_BARS
+    end_scan_pos = last - RIGHT_BARS
 
-    if real_pivot_candidate < LEFT_BARS:
+    if end_scan_pos < LEFT_BARS:
         log("   ⚠️ هنوز داده کافی برای تأیید پیوت نیست")
         return [], debug_log
 
+    if state.last_processed_ts is not None and state.last_processed_ts in closed_df_indexed.index:
+        try:
+            _loc = closed_df_indexed.index.get_loc(state.last_processed_ts)
+            if isinstance(_loc, slice):
+                _loc = _loc.start if _loc.start is not None else (LEFT_BARS - 1)
+            start_scan_pos = int(_loc) + 1
+        except Exception:
+            start_scan_pos = LEFT_BARS
+    else:
+        # state خالی است (اولین اجرا یا گزارش ۲۴h با temp_state) → کل بازه replay می‌شود
+        start_scan_pos = LEFT_BARS
+
+    start_scan_pos = max(start_scan_pos, LEFT_BARS)
+
     existing_high_ts = {p['ts'] for p in state.pivot_highs}
     existing_low_ts = {p['ts'] for p in state.pivot_lows}
-    ts_candidate = closed_df_indexed.index[real_pivot_candidate]
 
     new_pivots_high = []
     new_pivots_low = []
 
-    if not pd.isna(pivot_high.iloc[real_pivot_candidate]) and ts_candidate not in existing_high_ts:
-        new_pivots_high.append({
-            'ts': ts_candidate,
-            'price': float(pivot_high.iloc[real_pivot_candidate]),
-            'bar': real_pivot_candidate,
-            'rsi': float(rsi_val.iloc[real_pivot_candidate]) if not pd.isna(rsi_val.iloc[real_pivot_candidate]) else 0.0,
-            'macdline': float(macd_line.iloc[real_pivot_candidate]) if not pd.isna(macd_line.iloc[real_pivot_candidate]) else 0.0,
-            'hist': float(hist_line.iloc[real_pivot_candidate]) if not pd.isna(hist_line.iloc[real_pivot_candidate]) else 0.0
-        })
+    if start_scan_pos <= end_scan_pos:
+        for pos in range(start_scan_pos, end_scan_pos + 1):
+            ts_pos = closed_df_indexed.index[pos]
 
-    if not pd.isna(pivot_low.iloc[real_pivot_candidate]) and ts_candidate not in existing_low_ts:
-        new_pivots_low.append({
-            'ts': ts_candidate,
-            'price': float(pivot_low.iloc[real_pivot_candidate]),
-            'bar': real_pivot_candidate,
-            'rsi': float(rsi_val.iloc[real_pivot_candidate]) if not pd.isna(rsi_val.iloc[real_pivot_candidate]) else 0.0,
-            'macdline': float(macd_line.iloc[real_pivot_candidate]) if not pd.isna(macd_line.iloc[real_pivot_candidate]) else 0.0,
-            'hist': float(hist_line.iloc[real_pivot_candidate]) if not pd.isna(hist_line.iloc[real_pivot_candidate]) else 0.0
-        })
+            if not pd.isna(pivot_high.iloc[pos]) and ts_pos not in existing_high_ts:
+                ph_entry = {
+                    'ts': ts_pos,
+                    'price': float(pivot_high.iloc[pos]),
+                    'bar': pos,
+                    'rsi': float(rsi_val.iloc[pos]) if not pd.isna(rsi_val.iloc[pos]) else 0.0,
+                    'macdline': float(macd_line.iloc[pos]) if not pd.isna(macd_line.iloc[pos]) else 0.0,
+                    'hist': float(hist_line.iloc[pos]) if not pd.isna(hist_line.iloc[pos]) else 0.0
+                }
+                new_pivots_high.append(ph_entry)
+                state.pivot_highs.append(ph_entry)
+                existing_high_ts.add(ts_pos)
 
-    if new_pivots_high:
-        state.pivot_highs.extend(new_pivots_high)
-        if len(state.pivot_highs) > 500:
-            state.pivot_highs = state.pivot_highs[-500:]
-    if new_pivots_low:
-        state.pivot_lows.extend(new_pivots_low)
-        if len(state.pivot_lows) > 500:
-            state.pivot_lows = state.pivot_lows[-500:]
+            if not pd.isna(pivot_low.iloc[pos]) and ts_pos not in existing_low_ts:
+                pl_entry = {
+                    'ts': ts_pos,
+                    'price': float(pivot_low.iloc[pos]),
+                    'bar': pos,
+                    'rsi': float(rsi_val.iloc[pos]) if not pd.isna(rsi_val.iloc[pos]) else 0.0,
+                    'macdline': float(macd_line.iloc[pos]) if not pd.isna(macd_line.iloc[pos]) else 0.0,
+                    'hist': float(hist_line.iloc[pos]) if not pd.isna(hist_line.iloc[pos]) else 0.0
+                }
+                new_pivots_low.append(pl_entry)
+                state.pivot_lows.append(pl_entry)
+                existing_low_ts.add(ts_pos)
+
+    if len(state.pivot_highs) > 500:
+        state.pivot_highs = state.pivot_highs[-500:]
+    if len(state.pivot_lows) > 500:
+        state.pivot_lows = state.pivot_lows[-500:]
 
     state.last_processed_ts = closed_df_indexed.index[last]
-    log(f"   new_high={len(new_pivots_high)}, new_low={len(new_pivots_low)} | mem H={len(state.pivot_highs)} L={len(state.pivot_lows)}")
+    log(f"   new_high={len(new_pivots_high)}, new_low={len(new_pivots_low)} | mem H={len(state.pivot_highs)} L={len(state.pivot_lows)} | scan=[{start_scan_pos}..{end_scan_pos}]")
 
     # ------------------------------------------------------------------
     # تقاطع طلایی / مرگ
@@ -1129,10 +1234,9 @@ def detect_signal(df_1m, df_5m, state, symbol, debug=False):
     entry_price = float(close.iloc[-1])
     atr_now = float(atr14.iloc[-1]) if not pd.isna(atr14.iloc[-1]) else 0.0
 
-    best_classic_bull = None
-    best_hidden_bull = None
-    best_classic_bear = None
-    best_hidden_bear = None
+    hidden_signals = []
+    new_classic_bull_candidates = []
+    new_classic_bear_candidates = []
     cross_signals = []
 
     # تقاطع طلایی/مرگ (با گیت SSL — مثل Pine)
@@ -1142,7 +1246,7 @@ def detect_signal(df_1m, df_5m, state, symbol, debug=False):
             cross_signals.append({
                 'type': 'GOLDEN_CROSS', 'direction': 'BUY',
                 'entry': entry_price, 'stop': stop, 'target': target,
-                'extra': "⬆تقاطع طلایی", 'score': 0
+                'extra': "⬆تقاطع طلایی", 'score': 0, 'time': format_iran_time(ets)
             })
             log(f"   ⬆️ Golden Cross @ {ets}")
         elif etype == "SELL_CROSS" and gate_short:
@@ -1150,115 +1254,165 @@ def detect_signal(df_1m, df_5m, state, symbol, debug=False):
             cross_signals.append({
                 'type': 'DEATH_CROSS', 'direction': 'SELL',
                 'entry': entry_price, 'stop': stop, 'target': target,
-                'extra': "⬇تقاطع مرگ", 'score': 0
+                'extra': "⬇تقاطع مرگ", 'score': 0, 'time': format_iran_time(ets)
             })
             log(f"   ⬇️ Death Cross @ {ets}")
 
-    confirm_bar = last
-
-    # ---------- واگرایی نزولی — فقط با پیوت قبلیِ بلافاصله (Pine: var p_hi) ----------
-    if len(new_pivots_high) > 0 and len(state.pivot_highs) >= 2:
-        new_ph = new_pivots_high[0]
+    # ------------------------------------------------------------------
+    # ★★★ واگرایی نزولی — روی هر پیوت جدید (نه فقط آخرین) ★★★
+    #   قبلاً فقط new_pivots_high[0] چک می‌شد؛ حالا همه‌ی پیوت‌های جدیدِ این
+    #   Replay به‌ترتیب زمانی پردازش می‌شوند تا هیچ واگرایی‌ای از قلم نیفتد.
+    # ----------------------------------------------------------------------
+    for new_ph in new_pivots_high:
         idx = next((i for i, p in enumerate(state.pivot_highs) if p['ts'] == new_ph['ts']), None)
-        if idx is not None and idx >= 1:
-            ph_1 = state.pivot_highs[idx - 1]   # پیوت قبلی
-            ph_2 = state.pivot_highs[idx]       # پیوت جدید
-            bar1 = resolve_bar_from_ts(closed_df_indexed, ph_1['ts'])
-            bar2 = resolve_bar_from_ts(closed_df_indexed, ph_2['ts'])
+        if idx is None or idx < 1:
+            continue
+        ph_1 = state.pivot_highs[idx - 1]   # پیوت قبلی
+        ph_2 = state.pivot_highs[idx]       # پیوت جدید
+        bar1 = resolve_bar_from_ts(closed_df_indexed, ph_1['ts'])
+        bar2 = resolve_bar_from_ts(closed_df_indexed, ph_2['ts'])
+        if bar1 is None or bar2 is None:
+            continue
+        confirm_bar = min(bar2 + RIGHT_BARS, last)
 
-            # ✅ گیت SSL: مثل Pine — برچسب فقط با gate_short نمایش داده می‌شود
-            if bar1 is not None and bar2 is not None and trending.iloc[confirm_bar] and gate_short:
-                # ── کلاسیک نزولی: سقف بالاتر + اندیکاتور پایین‌تر ──
-                if ph_2['price'] > ph_1['price']:
-                    div_rsi = ph_2['rsi'] < ph_1['rsi']
-                    div_macd = ph_2['macdline'] < ph_1['macdline']
-                    # div_hist در Pine به‌دلیل ریستِ min_h_ph روی کندل تأیید
-                    # هرگز true نمی‌شود → برای برابری ۱۰۰٪ عمداً False
-                    div_hist = False
+        # ✅ گیت SSL + ADX: مثل «ورود واقعی» در Pine — برچسب فقط با gate_short نمایش داده می‌شود
+        if not (trending.iloc[confirm_bar] and gate_short):
+            continue
 
-                    if div_rsi or div_macd or div_hist:
-                        fib_ok = check_fib_near(high, low, confirm_bar, ph_2['price'], is_high_side=True, tol_pct=FIB_TOLERANCE_PCT)
-                        pa_ok = check_shooting_star(closed_df, ph_2['bar'])
-                        score = int(div_rsi) + int(div_hist) + int(div_macd) + int(fib_ok) + int(pa_ok)
-                        log(f"   🔴 Classic Bearish [{bar1}↔{bar2}]: score={score}/5")
+        # ── کلاسیک نزولی: سقف بالاتر + اندیکاتور پایین‌تر ──
+        if ph_2['price'] > ph_1['price']:
+            div_rsi = ph_2['rsi'] < ph_1['rsi']
+            div_macd = ph_2['macdline'] < ph_1['macdline']
+            # div_hist در Pine به‌دلیل ریستِ min_h_ph روی کندل تأیید هرگز true نمی‌شود
+            div_hist = False
 
-                        if score >= MIN_CLASSIC_SCORE:
-                            stop, target = compute_divergence_sl_tp(ph_1['price'], ph_2['price'], "short", entry_price, symbol)
-                            if stop and target:
-                                best_classic_bear = {
-                                    'type': 'CLASSIC_BEARISH_DIV', 'direction': 'SELL',
-                                    'entry': entry_price, 'stop': stop, 'target': target,
-                                    'extra': f"{score_stars(score)}\nواگرایی↓[{score}/5]", 'score': score
-                                }
-                                log(f"   🔴 Classic Bearish Div SELECTED: score={score}/5")
+            if div_rsi or div_macd or div_hist:
+                fib_ok = check_fib_near(high, low, bar2, ph_2['price'], is_high_side=True, tol_pct=FIB_TOLERANCE_PCT)
+                pa_ok = check_shooting_star(closed_df, ph_2['bar'])
+                score = int(div_rsi) + int(div_hist) + int(div_macd) + int(fib_ok) + int(pa_ok)
+                log(f"   🔴 Classic Bearish [{bar1}↔{bar2}]: score={score}/5")
 
-                # ── مخفی نزولی: سقف پایین‌تر + اندیکاتور بالاتر ──
-                elif ph_2['price'] < ph_1['price']:
-                    hid = (ph_2['rsi'] > ph_1['rsi']) or (ph_2['macdline'] > ph_1['macdline'])
-                    if hid:
-                        stop, target = compute_divergence_sl_tp(ph_1['price'], ph_2['price'], "short", entry_price, symbol)
-                        if stop and target:
-                            best_hidden_bear = {
-                                'type': 'HIDDEN_BEARISH_DIV', 'direction': 'SELL',
-                                'entry': entry_price, 'stop': stop, 'target': target,
-                                'extra': "~واگرایی مخفی↓", 'score': 0
-                            }
-                            log(f"   🟠 Hidden Bearish Div [{bar1}↔{bar2}]")
+                if score >= MIN_CLASSIC_SCORE:
+                    stop, target = compute_divergence_sl_tp(ph_1['price'], ph_2['price'], "short", entry_price, symbol)
+                    if stop and target:
+                        sig = {
+                            'type': 'CLASSIC_BEARISH_DIV', 'direction': 'SELL',
+                            'entry': entry_price, 'stop': stop, 'target': target,
+                            'extra': f"{score_stars(score)}\nواگرایی↓[{score}/5]", 'score': score,
+                            'time': format_iran_time(ph_2['ts']), 'pivot_ts': str(ph_2['ts'])
+                        }
+                        if REQUIRE_PA_CONFIRMATION:
+                            confirm_start_ts = closed_df_indexed.index[confirm_bar]
+                            deadline_ts = confirm_start_ts + pd.Timedelta(minutes=WAIT_BARS_PA_CONFIRM)
+                            new_classic_bear_candidates.append({
+                                'signal': sig, 'direction': 'short',
+                                'confirm_start_ts': confirm_start_ts, 'deadline_ts': deadline_ts
+                            })
+                            log(f"   ⏳ Classic Bearish Div در انتظار کندل تأییدیه تا {format_iran_time(deadline_ts)}")
+                        else:
+                            hidden_signals.append(sig)
+                            log(f"   🔴 Classic Bearish Div SELECTED: score={score}/5")
 
-    # ---------- واگرایی صعودی — فقط با پیوت قبلیِ بلافاصله (Pine: var p_lo) ----------
-    if len(new_pivots_low) > 0 and len(state.pivot_lows) >= 2:
-        new_pl = new_pivots_low[0]
+        # ── مخفی نزولی: سقف پایین‌تر + اندیکاتور بالاتر (بدون گیت تأییدیه، مطابق Pine) ──
+        elif ph_2['price'] < ph_1['price']:
+            hid = (ph_2['rsi'] > ph_1['rsi']) or (ph_2['macdline'] > ph_1['macdline'])
+            if hid:
+                stop, target = compute_divergence_sl_tp(ph_1['price'], ph_2['price'], "short", entry_price, symbol)
+                if stop and target:
+                    hidden_signals.append({
+                        'type': 'HIDDEN_BEARISH_DIV', 'direction': 'SELL',
+                        'entry': entry_price, 'stop': stop, 'target': target,
+                        'extra': "~واگرایی مخفی↓", 'score': 0,
+                        'time': format_iran_time(ph_2['ts']), 'pivot_ts': str(ph_2['ts'])
+                    })
+                    log(f"   🟠 Hidden Bearish Div [{bar1}↔{bar2}]")
+
+    # ------------------------------------------------------------------
+    # ★★★ واگرایی صعودی — روی هر پیوت جدید (نه فقط آخرین) ★★★
+    # ------------------------------------------------------------------
+    for new_pl in new_pivots_low:
         idx = next((i for i, p in enumerate(state.pivot_lows) if p['ts'] == new_pl['ts']), None)
-        if idx is not None and idx >= 1:
-            pl_1 = state.pivot_lows[idx - 1]   # پیوت قبلی
-            pl_2 = state.pivot_lows[idx]       # پیوت جدید
-            bar1 = resolve_bar_from_ts(closed_df_indexed, pl_1['ts'])
-            bar2 = resolve_bar_from_ts(closed_df_indexed, pl_2['ts'])
+        if idx is None or idx < 1:
+            continue
+        pl_1 = state.pivot_lows[idx - 1]   # پیوت قبلی
+        pl_2 = state.pivot_lows[idx]       # پیوت جدید
+        bar1 = resolve_bar_from_ts(closed_df_indexed, pl_1['ts'])
+        bar2 = resolve_bar_from_ts(closed_df_indexed, pl_2['ts'])
+        if bar1 is None or bar2 is None:
+            continue
+        confirm_bar = min(bar2 + RIGHT_BARS, last)
 
-            # ✅ گیت SSL: مثل Pine — برچسب فقط با gate_long نمایش داده می‌شود
-            if bar1 is not None and bar2 is not None and trending.iloc[confirm_bar] and gate_long:
-                # ── کلاسیک صعودی: کف پایین‌تر + اندیکاتور بالاتر ──
-                if pl_2['price'] < pl_1['price']:
-                    div_rsi = pl_2['rsi'] > pl_1['rsi']
-                    div_macd = pl_2['macdline'] > pl_1['macdline']
-                    div_hist = False   # در Pine هرگز true نمی‌شود (باگ ریست max_h_pl)
+        # ✅ گیت SSL + ADX: مثل «ورود واقعی» در Pine — برچسب فقط با gate_long نمایش داده می‌شود
+        if not (trending.iloc[confirm_bar] and gate_long):
+            continue
 
-                    if div_rsi or div_macd or div_hist:
-                        fib_ok = check_fib_near(high, low, confirm_bar, pl_2['price'], is_high_side=False, tol_pct=FIB_TOLERANCE_PCT)
-                        pa_ok = check_hammer(closed_df, pl_2['bar'])
-                        score = int(div_rsi) + int(div_hist) + int(div_macd) + int(fib_ok) + int(pa_ok)
-                        log(f"   🟢 Classic Bullish [{bar1}↔{bar2}]: score={score}/5")
+        # ── کلاسیک صعودی: کف پایین‌تر + اندیکاتور بالاتر ──
+        if pl_2['price'] < pl_1['price']:
+            div_rsi = pl_2['rsi'] > pl_1['rsi']
+            div_macd = pl_2['macdline'] > pl_1['macdline']
+            div_hist = False   # در Pine هرگز true نمی‌شود (باگ ریست max_h_pl)
 
-                        if score >= MIN_CLASSIC_SCORE:
-                            stop, target = compute_divergence_sl_tp(pl_1['price'], pl_2['price'], "long", entry_price, symbol)
-                            if stop and target:
-                                best_classic_bull = {
-                                    'type': 'CLASSIC_BULLISH_DIV', 'direction': 'BUY',
-                                    'entry': entry_price, 'stop': stop, 'target': target,
-                                    'extra': f"{score_stars(score)}\nواگرایی↑[{score}/5]", 'score': score
-                                }
-                                log(f"   🟢 Classic Bullish Div SELECTED: score={score}/5")
+            if div_rsi or div_macd or div_hist:
+                fib_ok = check_fib_near(high, low, bar2, pl_2['price'], is_high_side=False, tol_pct=FIB_TOLERANCE_PCT)
+                pa_ok = check_hammer(closed_df, pl_2['bar'])
+                score = int(div_rsi) + int(div_hist) + int(div_macd) + int(fib_ok) + int(pa_ok)
+                log(f"   🟢 Classic Bullish [{bar1}↔{bar2}]: score={score}/5")
 
-                # ── مخفی صعودی: کف بالاتر + اندیکاتور پایین‌تر ──
-                elif pl_2['price'] > pl_1['price']:
-                    hid = (pl_2['rsi'] < pl_1['rsi']) or (pl_2['macdline'] < pl_1['macdline'])
-                    if hid:
-                        stop, target = compute_divergence_sl_tp(pl_1['price'], pl_2['price'], "long", entry_price, symbol)
-                        if stop and target:
-                            best_hidden_bull = {
-                                'type': 'HIDDEN_BULLISH_DIV', 'direction': 'BUY',
-                                'entry': entry_price, 'stop': stop, 'target': target,
-                                'extra': "~واگرایی مخفی↑", 'score': 0
-                            }
-                            log(f"   🔵 Hidden Bullish Div [{bar1}↔{bar2}]")
+                if score >= MIN_CLASSIC_SCORE:
+                    stop, target = compute_divergence_sl_tp(pl_1['price'], pl_2['price'], "long", entry_price, symbol)
+                    if stop and target:
+                        sig = {
+                            'type': 'CLASSIC_BULLISH_DIV', 'direction': 'BUY',
+                            'entry': entry_price, 'stop': stop, 'target': target,
+                            'extra': f"{score_stars(score)}\nواگرایی↑[{score}/5]", 'score': score,
+                            'time': format_iran_time(pl_2['ts']), 'pivot_ts': str(pl_2['ts'])
+                        }
+                        if REQUIRE_PA_CONFIRMATION:
+                            confirm_start_ts = closed_df_indexed.index[confirm_bar]
+                            deadline_ts = confirm_start_ts + pd.Timedelta(minutes=WAIT_BARS_PA_CONFIRM)
+                            new_classic_bull_candidates.append({
+                                'signal': sig, 'direction': 'long',
+                                'confirm_start_ts': confirm_start_ts, 'deadline_ts': deadline_ts
+                            })
+                            log(f"   ⏳ Classic Bullish Div در انتظار کندل تأییدیه تا {format_iran_time(deadline_ts)}")
+                        else:
+                            hidden_signals.append(sig)
+                            log(f"   🟢 Classic Bullish Div SELECTED: score={score}/5")
+
+        # ── مخفی صعودی: کف بالاتر + اندیکاتور پایین‌تر (بدون گیت تأییدیه، مطابق Pine) ──
+        elif pl_2['price'] > pl_1['price']:
+            hid = (pl_2['rsi'] < pl_1['rsi']) or (pl_2['macdline'] < pl_1['macdline'])
+            if hid:
+                stop, target = compute_divergence_sl_tp(pl_1['price'], pl_2['price'], "long", entry_price, symbol)
+                if stop and target:
+                    hidden_signals.append({
+                        'type': 'HIDDEN_BULLISH_DIV', 'direction': 'BUY',
+                        'entry': entry_price, 'stop': stop, 'target': target,
+                        'extra': "~واگرایی مخفی↑", 'score': 0,
+                        'time': format_iran_time(pl_2['ts']), 'pivot_ts': str(pl_2['ts'])
+                    })
+                    log(f"   🔵 Hidden Bullish Div [{bar1}↔{bar2}]")
+
+    # ------------------------------------------------------------------
+    # ★★★ پردازش صف تأییدیه (قدیمی + جدید) — فقط واگرایی کلاسیک ★★★
+    # ------------------------------------------------------------------
+    confirmed_bull_signals = []
+    confirmed_bear_signals = []
+    if REQUIRE_PA_CONFIRMATION:
+        bull_queue = state.pending_bull_divs + new_classic_bull_candidates
+        bear_queue = state.pending_bear_divs + new_classic_bear_candidates
+        confirmed_bull_signals, state.pending_bull_divs = process_pending_confirmations(
+            closed_df_indexed, closed_df, bull_queue, log)
+        confirmed_bear_signals, state.pending_bear_divs = process_pending_confirmations(
+            closed_df_indexed, closed_df, bear_queue, log)
 
     # ------------------------------------------------------------------
     # جمع‌آوری نهایی
     # ------------------------------------------------------------------
     signals = []
-    for sig in [best_classic_bull, best_hidden_bull, best_classic_bear, best_hidden_bear]:
-        if sig is not None:
-            signals.append(sig)
+    signals.extend(confirmed_bull_signals)
+    signals.extend(confirmed_bear_signals)
+    signals.extend(hidden_signals)
     signals.extend(cross_signals)
 
     if not signals:
@@ -1534,6 +1688,7 @@ def analyze_and_execute():
                         f"━━━━━━━━━━━━━━━━━━━━━━\n"
                         f"🔸 جهت: *{dir_txt}*\n"
                         f"📝 {sig['extra']}\n"
+                        f"🕐 زمان سیگنال (پیوت): `{sig.get('time', '—')}`\n"
                         f"━━━━━━━━━━━━━━━━━━━━━━\n"
                         f"📍 ورود: `{entry:.{PRICE_PRECISION.get(symbol, 2)}f}`\n"
                         f"🛑 حد ضرر: `{stop:.{PRICE_PRECISION.get(symbol, 2)}f}`\n"
@@ -1591,6 +1746,7 @@ def analyze_and_execute():
                     f"━━━━━━━━━━━━━━━━━━━━━━\n"
                     f"🔸 جهت: *{dir_txt}*\n"
                     f"📝 {sig['extra']}\n"
+                    f"🕐 زمان سیگنال (پیوت): `{sig.get('time', '—')}`\n"
                     f"━━━━━━━━━━━━━━━━━━━━━━\n"
                     f"📍 ورود: `{entry:.{PRICE_PRECISION.get(symbol, 2)}f}`\n"
                     f"🛑 حد ضرر: `{stop:.{PRICE_PRECISION.get(symbol, 2)}f}`\n"
@@ -1795,13 +1951,14 @@ def analyze_last_24h_and_send_report():
                         f"━━━━━━━━━━━━━━━━━━━━━━\n"
                         f"🔸 جهت: *{dir_txt}*\n"
                         f"📝 {sig['extra']}\n"
+                        f"🕐 زمان دقیق سیگنال: `{sig.get('time', '—')}`\n"
                         f"━━━━━━━━━━━━━━━━━━━━━━\n"
                         f"📍 ورود: `{sig['entry']:.{PRICE_PRECISION.get(symbol, 2)}f}`\n"
                         f"🛑 حد ضرر: `{sig['stop']:.{PRICE_PRECISION.get(symbol, 2)}f}`\n"
                         f"🎯 حد سود: `{sig['target']:.{PRICE_PRECISION.get(symbol, 2)}f}`\n"
                         f"━━━━━━━━━━━━━━━━━━━━━━\n"
                         f"⚠️ *فقط تحلیل — بدون معامله*\n"
-                        f"🕒 {now_str}"
+                        f"🕒 گزارش تهیه‌شده در: {now_str}"
                     )
                     send_telegram_message(msg)
                     time.sleep(0.5)
@@ -1856,6 +2013,9 @@ def analyze_last_24h_and_send_report():
                         f.write(f"│ {dir_emoji} نوع: {sig['type']}\n")
                         f.write(f"│ 📊 جهت: {dir_txt}\n")
                         f.write(f"│ 📝 توضیحات: {sig['extra']}\n")
+                        f.write(f"│ 🕐 تاریخ و ساعت دقیق سیگنال: {sig.get('time', '—')}\n")
+                        if sig.get('confirm_time'):
+                            f.write(f"│ ✅ زمان تأییدیه پرایس‌اکشن: {sig['confirm_time']}\n")
                         f.write(f"│ ──────────────────────────────────────────\n")
                         f.write(f"│ 📍 ورود     : {entry:.{PRICE_PRECISION.get(symbol, 2)}f}\n")
                         f.write(f"│ 🛑 حد ضرر   : {stop:.{PRICE_PRECISION.get(symbol, 2)}f}\n")
@@ -1941,11 +2101,18 @@ if __name__ == "__main__":
     ssl_status_msg = compute_ssl_hybrid_status()
     send_telegram_message(ssl_status_msg)
     
-    # ★ حالت لایو - ریست کامل state (قبل از هر چیز)
-    if LIVE_MODE:
+    # ★★★ رفع باگ اسپم روی هر ری‌استارت ★★★
+    # قبلاً reset_state_for_live_mode() روی هر بار اجرای برنامه (حتی کرش/دیپلوی
+    # ساده) کل پیوت‌ها و last_ma_ts را پاک می‌کرد؛ در نتیجه اسکن تقاطع
+    # طلایی/مرگ از صفر روی کل تاریخچه اجرا می‌شد و سیگنال‌های قدیمی دوباره
+    # پردازش/ثبت می‌شدند. طبق تصمیم شما، state اکنون بین ری‌استارت‌ها حفظ
+    # می‌شود (نه پاک) — فقط با ست کردن متغیر محیطی FORCE_RESET_STATE=1 می‌توان
+    # عمداً یک‌بار state را صفر کرد.
+    if os.getenv("FORCE_RESET_STATE") == "1":
+        logger.info("[STARTUP] FORCE_RESET_STATE=1 → ریست دستی state")
         reset_state_for_live_mode()
-    
-    # بارگذاری state (که الان خالی است)
+
+    # بارگذاری state (در حالت عادی: state قبلی از دیسک بازیابی می‌شود)
     load_signal_counter()
     load_states()
 
@@ -1994,3 +2161,4 @@ if __name__ == "__main__":
     
     # شروع حلقه اصلی
     main_loop()
+
