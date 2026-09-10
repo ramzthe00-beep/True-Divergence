@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-main.py — DTM v6·FC Bot (نسخه‌ی بازنویسی‌شده — Pine-Exact روی واگرایی/تقاطع)
+main.py — DTM v6·FC Bot (نسخه‌ی اصلاح‌شده — سازگار با exchange_client.py جدید)
 =====================================================================
 این فایل فقط «چسبِ» پروژه است: داده می‌گیرد (exchange_client)، به موتور
 تشخیص می‌دهد (divergence_engine که خودش ssl_hybrid را برای گیت به‌کار
@@ -11,6 +11,27 @@ main.py — DTM v6·FC Bot (نسخه‌ی بازنویسی‌شده — Pine-Exa
 منطقِ ظهورِ برچسبِ واگرایی/تقاطع است (divergence_engine.py + ssl_hybrid.py).
 منطقِ اینجا (حجم معامله، استاپ/تارگت، ریسک‌فری و ...) عمداً ساده و
 مستقل نگه داشته شده چون کاربر گفته «کاری به منطق ورود ندارم».
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  تغییرات این نسخه نسبت به قبل (به‌دلیل تغییرِ exchange_client.py):
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  ۱) امضای fetch_ohlcv عوض شده: قبلاً (symbol, "1m", limit) بود، الان
+     (symbol, timeframe="1") است و history_bars از سازنده‌ی MarketData
+     می‌آید. هر فراخوانیِ قدیمی این‌جا آپدیت شد.
+
+  ۲) 🔴 رفع یک ناهماهنگیِ واقعی: divergence_engine.py رویِ لاگِ واقعیِ
+     پاین (نماد BINANCE:ETHUSDT — یعنی چارتِ پاین از فیدِ بایننس
+     می‌خواند) ممیزی و «۱۰۰٪ منطبق» تأیید شده بود. اما نسخه‌ی قبلیِ این
+     فایل، df ورودیِ engine.process() را از market.fetch_ohlcv() یعنی
+     صرافیِ TheTrueTrade می‌گرفت — نه بایننس. این یعنی ادعای «Pine-Exact»
+     دیگر برقرار نبود، چون کندل‌های TheTrueTrade با کندل‌های بایننس (که
+     خودِ پاین رویشان اجرا شده) لزوماً یکی نیستند.
+     رفع شد با همان الگویی که در پروژه‌ی موازیِ کاربر (fetch_ohlcv_binance
+     برای سیگنال + fetch_ohlcv برای اجرا) دیده شد:
+       • df_signal = market.fetch_ohlcv_binance(...)  → ورودیِ موتور تشخیص
+       • لنگرِ قیمتِ ورود/اجرا از market.fetch_current_price(...) که خودِ
+         TheTrueTrade است (چون سفارش واقعاً رویِ آن صرافی اجرا می‌شود و
+         قیمتِ ورودِ واقعی باید مالِ همان بازار باشد، نه بایننس).
 """
 
 import os
@@ -47,6 +68,7 @@ STATE_FILE = "engine_state.json"
 HISTORY_FILE = "trades_history.json"
 HISTORY_BARS = 500          # کندل‌های ۱ دقیقه‌ای برای هر چرخه‌ی تحلیل
 LOOP_SLEEP_SEC = 60
+SIGNAL_TIMEFRAME = "1"      # ← فرمتِ جدید: عددِ خامِ دقیقه (نه "1m")
 
 # ── تنظیمات معاملاتی (خارج از دامنه‌ی «تطابق ۱۰۰٪ با پاین») ──────────
 TARGET_RISK_USDT = 3.5
@@ -55,7 +77,7 @@ STOP_BUFFER_TICKS = 5
 CROSS_ATR_STOP_MULT = 2.0
 
 notifier = TelegramNotifier(TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID, logger=logger)
-market = ex.MarketData(BASE_URL)
+market = ex.MarketData(BASE_URL, history_bars=HISTORY_BARS)
 exchange = ex.PrivateExchange(API_KEY, API_SECRET, BASE_URL)
 
 
@@ -163,13 +185,13 @@ def format_signal_message(symbol, event: de.LabelEvent, entry=None, stop=None, t
         "━━━━━━━━━━━━━━━━━━━━━━",
         f"🔸 جهت: *{dir_txt}*",
         f"📝 برچسبِ پاین: {event.extra_text.replace(chr(10), ' | ')}",
-        f"🕐 زمانِ دقیقِ ظهور برچسب: `{format_iran_time(event.timestamp)}`",
+        f"🕐 زمانِ دقیقِ ظهور برچسب (بایننس): `{format_iran_time(event.timestamp)}`",
     ]
     if entry is not None and stop is not None and target is not None:
         prec = ex.PRICE_PRECISION.get(symbol, 2)
         lines += [
             "━━━━━━━━━━━━━━━━━━━━━━",
-            f"📍 ورود: `{entry:.{prec}f}`",
+            f"📍 ورود (لنگرِ صرافیِ اجرا): `{entry:.{prec}f}`",
             f"🛑 حد ضرر: `{stop:.{prec}f}`",
             f"🎯 حد سود: `{target:.{prec}f}`",
         ]
@@ -190,7 +212,7 @@ def track_open_trades():
     changed = False
     for t in open_trades:
         symbol, direction = t["symbol"], t["direction"]
-        cp = market.fetch_current_price(symbol)
+        cp = market.fetch_current_price(symbol)   # قیمتِ لحظه‌ایِ صرافیِ اجرا (TheTrueTrade)
         if cp is None:
             continue
         entry, stop, target = t["entry"], t["stop"], t["target"]
@@ -243,12 +265,14 @@ def _next_signal_number():
 def process_symbol(symbol, engine: de.DivergenceEngine):
     global _first_run
 
-    df = market.fetch_ohlcv(symbol, "1m", HISTORY_BARS)
-    if df is None or df.empty:
-        logger.warning(f"[SKIP] {symbol}: داده دریافت نشد")
+    # ── منبع سیگنال: بایننس (همان چیزی که divergence_engine.py رویش
+    #    ممیزی و ۱۰۰٪ منطبق تأیید شده — نماد لاگ پاین BINANCE:ETHUSDT بود) ──
+    df_signal = market.fetch_ohlcv_binance(symbol, SIGNAL_TIMEFRAME)
+    if df_signal is None or df_signal.empty:
+        logger.warning(f"[SKIP] {symbol}: داده‌ی بایننس دریافت نشد")
         return
 
-    events = engine.process(df)
+    events = engine.process(df_signal)
     if not events:
         return
 
@@ -256,12 +280,24 @@ def process_symbol(symbol, engine: de.DivergenceEngine):
         logger.info(f"[FIRST_RUN] {symbol}: {len(events)} رویداد یافت شد — فقط ۲ تای آخر نمایش داده می‌شود")
         events = events[-2:]
 
-    atr_series = de.calc_atr(df["high"], df["low"], df["close"])
+    atr_series = de.calc_atr(df_signal["high"], df_signal["low"], df_signal["close"])
     balance = exchange.fetch_balance() or 0.0
     history = load_history()
 
     for event in events:
-        entry_price = event.price_at_signal
+        # ── لنگرِ قیمتِ ورودِ واقعی: از خودِ صرافیِ اجرا (TheTrueTrade)،
+        #    نه از قیمتِ بایننس در لحظه‌ی رویداد — چون سفارش واقعاً روی
+        #    همان صرافی اجرا می‌شود و قیمت بازار می‌تواند کمی فرق داشته باشد.
+        #    اگر به هر دلیلی قیمتِ لحظه‌ای صرافیِ اجرا در دسترس نبود،
+        #    برای امنیت به همان قیمتِ لحظه‌ی رویداد در بایننس برمی‌گردیم. ──
+        exec_anchor = market.fetch_current_price(symbol)
+        entry_price = exec_anchor if exec_anchor is not None else event.price_at_signal
+        if exec_anchor is None:
+            logger.warning(
+                f"[ANCHOR] {symbol}: قیمتِ لحظه‌ایِ صرافیِ اجرا در دسترس نبود — "
+                f"از قیمتِ بایننس ({event.price_at_signal}) به‌عنوان جایگزین استفاده شد."
+            )
+
         atr_now = float(atr_series.iloc[event.bar_index]) if not pd.isna(atr_series.iloc[event.bar_index]) else 0.0
         stop, target = compute_stop_target(event, entry_price, atr_now, symbol)
 
@@ -336,6 +372,8 @@ def main_loop():
         f"🤖 *DTM Bot — آنلاین*\n"
         f"━━━━━━━━━━━━━━━━━━━━━━\n"
         f"🧠 سیگنال‌ها: واگرایی کلاسیک/مخفی + تقاطع طلایی/مرگ (Pine-Exact)\n"
+        f"📡 منبعِ دادهٔ سیگنال: بایننس (اسپات، عمومی)\n"
+        f"💱 صرافیِ اجرا: TheTrueTrade\n"
         f"🔷 گیت SSL Hybrid: تک‌تایم‌فریمی روی ۱ دقیقه\n"
         f"⚙️ Pivot: {de.PIVOT_LEFT}/{de.PIVOT_RIGHT} | RSI({de.RSI_LEN}) | MACD({de.MACD_FAST},{de.MACD_SLOW},{de.MACD_SIGNAL})\n"
         f"━━━━━━━━━━━━━━━━━━━━━━\n🕒 {format_iran_time()}"
