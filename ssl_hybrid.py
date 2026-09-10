@@ -92,16 +92,16 @@ def _sma(s: pd.Series, length: int) -> pd.Series:
 def _ema(s: pd.Series, length: int) -> pd.Series:
     """معادل ta.ema پاین: بذر = اولین مقدار سری، نه SMA."""
     alpha = 2.0 / (length + 1)
-    out = pd.Series(np.nan, index=s.index)
+    n = len(s)
+    out_vals = np.full(n, np.nan)
     fv = s.first_valid_index()
     if fv is None:
-        return out
+        return pd.Series(out_vals, index=s.index)
     pos0 = s.index.get_loc(fv)
-    out.iloc[pos0] = s.iloc[pos0]
-    prev = out.iloc[pos0]
-    vals = s.to_numpy(dtype=float)
-    out_vals = out.to_numpy(dtype=float)
-    for i in range(pos0 + 1, len(s)):
+    vals = s.to_numpy(dtype=float).copy()
+    prev = vals[pos0]
+    out_vals[pos0] = prev
+    for i in range(pos0 + 1, n):
         prev = alpha * vals[i] + (1 - alpha) * prev
         out_vals[i] = prev
     return pd.Series(out_vals, index=s.index)
