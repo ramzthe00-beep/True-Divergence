@@ -35,6 +35,7 @@ import logging
 
 import requests
 import pandas as pd
+from typing import Optional, List, Dict, Tuple
 
 logger = logging.getLogger("exchange")
 
