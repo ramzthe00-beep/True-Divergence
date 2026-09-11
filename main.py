@@ -46,6 +46,7 @@ from flask import Flask
 import exchange_client as ex
 import divergence_engine as de
 import ssl_hybrid  # noqa: F401  (وابستگیِ غیرمستقیم از طریق divergence_engine)
+import chart_renderer
 from telegram_logger import TelegramNotifier, setup_logging, format_iran_time, format_iran_date
 
 logger = setup_logging()
@@ -201,6 +202,36 @@ def format_signal_message(symbol, event: de.LabelEvent, entry=None, stop=None, t
     return "\n".join(lines)
 
 
+def send_signal_message(symbol, event: de.LabelEvent, df_signal, entry=None, stop=None, target=None,
+                         signal_number=None, informational=False):
+    """
+    پیامِ سیگنال را می‌فرستد. اگر entry/stop/target هر سه موجود باشند، ابتدا
+    تصویرِ چارت (با باکسِ ورود/حدسود/حدضرر) ساخته می‌شود و پیام به‌صورتِ
+    کپشنِ همان عکس ارسال می‌شود (یعنی متن دقیقاً «در ذیلِ عکس» می‌آید).
+    اگر رسم یا ارسالِ عکس به هر دلیلی شکست بخورد، به همان پیامِ متنیِ
+    ساده‌ی قبلی برمی‌گردیم تا هیچ سیگنالی از دست نرود.
+    """
+    text = format_signal_message(symbol, event, entry, stop, target, signal_number, informational)
+
+    if entry is not None and stop is not None and target is not None:
+        try:
+            prec = ex.PRICE_PRECISION.get(symbol, 2)
+            img_bytes = chart_renderer.render_signal_chart(
+                df_signal, entry, stop, target, event.direction, symbol,
+                signal_number=signal_number, price_precision=prec,
+            )
+        except Exception as e:
+            logger.error(f"[CHART] {symbol}: خطا در ساختِ تصویرِ چارت: {e}")
+            img_bytes = None
+
+        if img_bytes:
+            if notifier.send_photo(img_bytes, caption=text):
+                return
+            logger.warning(f"[CHART] {symbol}: ارسالِ عکسِ چارت ناموفق بود — بازگشت به پیامِ متنیِ ساده")
+
+    notifier.send(text)
+
+
 # ═══════════════════════════════════════════════════════════════════
 # پیگیری معاملات باز (TP/SL/ریسک‌فری)
 # ═══════════════════════════════════════════════════════════════════
@@ -302,11 +333,11 @@ def process_symbol(symbol, engine: de.DivergenceEngine):
         stop, target = compute_stop_target(event, entry_price, atr_now, symbol)
 
         if _first_run or stop is None or target is None:
-            notifier.send(format_signal_message(symbol, event, entry_price, stop, target, informational=True))
+            send_signal_message(symbol, event, df_signal, entry_price, stop, target, informational=True)
             continue
 
         signal_number = _next_signal_number()
-        notifier.send(format_signal_message(symbol, event, entry_price, stop, target, signal_number))
+        send_signal_message(symbol, event, df_signal, entry_price, stop, target, signal_number)
 
         prec = ex.PRICE_PRECISION.get(symbol, 2)
         stop_pct = abs(entry_price - stop) / entry_price
