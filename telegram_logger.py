@@ -94,6 +94,50 @@ class TelegramNotifier:
             time.sleep(1.0)
         return ok
 
+    def send_photo(self, photo_bytes: bytes, caption: str = "", max_attempts: int = 3) -> bool:
+        """
+        ارسالِ عکس (مثلاً تصویرِ چارت) به همراهِ کپشن. کپشنِ تلگرام حداکثر
+        ۱۰۲۴ کاراکتر مجاز است؛ اگر متن بلندتر بود بریده می‌شود (چون در این
+        پروژه پیامِ سیگنال معمولاً کوتاه‌تر از این حد است).
+        """
+        if not photo_bytes:
+            return False
+        url = f"https://api.telegram.org/bot{self.bot_token}/sendPhoto"
+        cap = str(caption)[:1024]
+        for attempt in range(max_attempts):
+            try:
+                files = {"photo": ("chart.png", photo_bytes, "image/png")}
+                data = {"chat_id": self.chat_id, "caption": cap, "parse_mode": "Markdown"}
+                r = requests.post(url, files=files, data=data, timeout=30)
+                if r.status_code == 200:
+                    return True
+                if r.status_code == 429:
+                    retry_after = 10
+                    try:
+                        retry_after = r.json().get("parameters", {}).get("retry_after", 10)
+                    except Exception:
+                        pass
+                    if attempt == max_attempts - 1:
+                        self.logger.error(f"[TELEGRAM-PHOTO] rate-limit پس از {max_attempts} تلاش: {r.text[:200]}")
+                        return False
+                    time.sleep(min(retry_after + 2, 30))
+                    continue
+                if r.status_code == 400 and attempt == 0:
+                    # احتمالِ ناسازگاریِ Markdown در کپشن — بدون parse_mode دوباره تلاش کن
+                    files2 = {"photo": ("chart.png", photo_bytes, "image/png")}
+                    data2 = {"chat_id": self.chat_id, "caption": cap}
+                    r2 = requests.post(url, files=files2, data=data2, timeout=30)
+                    if r2.status_code == 200:
+                        return True
+                self.logger.error(f"[TELEGRAM-PHOTO] ارسال ناموفق: {r.status_code} {r.text[:200]}")
+                return False
+            except Exception as e:
+                self.logger.error(f"[TELEGRAM-PHOTO] Exception: {e}")
+                if attempt == max_attempts - 1:
+                    return False
+                time.sleep(2 ** attempt)
+        return False
+
     def send_document(self, filepath: str, caption: str = "") -> bool:
         url = f"https://api.telegram.org/bot{self.bot_token}/sendDocument"
         try:
