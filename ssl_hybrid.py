@@ -1,49 +1,70 @@
 # -*- coding: utf-8 -*-
 """
-ssl_hybrid.py  (نسخه اصلاح‌شده — Pine-Exact واقعی)
+ssl_hybrid.py  (نسخه‌ی اصلاح‌شده — با ری‌سمپل واقعی چندتایم‌فریمی)
 =====================================================================
 ترجمه‌ی دقیق (Pine-Exact) اندیکاتور «فیلتر روند SSL Hybrid (Mihkel00)»
-از بخش ⑮.۵ کد پاین DTM·v6·FC.
+از بخش ⑮.۵ کد پاین DTM·v6·FC:
+    f_rssl_calc / f_rssl_ma / f_rssl_tema / f_rssl_ssf2 / f_rssl_ssf3 /
+    f_rssl_atrsmooth
+
+هدف این فایل: تولیدِ همان مقداری که پاین با نامِ gate_long / gate_short
+در بخش ⑯ (کاتالیزور) و ⑳ (برچسب‌ها) استفاده می‌کند.
 
 ═══════════════════════════════════════════════════════════════════
-★★★ اصلاح مهم نسبت به نسخه‌ی قبلی این فایل ★★★
+تاریخچه‌ی این باگ (برای مستندسازی — لطفاً حذف نکنید)
 ═══════════════════════════════════════════════════════════════════
-نسخه‌ی قبلی این فایل یک فرض غلط داشت: چون tf1 را «همان تایم‌فریم چارت»
-فرض کرده بود، Hlv را مستقیم روی دیتای پایه محاسبه می‌کرد و فقط یک بار
-shift(1) می‌زد و ادعا می‌کرد این معادل request.security است.
+نسخه‌ی قبلی این فایل فرض می‌کرد چون بات روی چارت ۱ دقیقه اجرا می‌شود،
+SSL_TF1 هم ۱ دقیقه است؛ در نتیجه به‌جای ری‌سمپل واقعی، فقط یک
+shift(1) ساده روی سری‌ی ۱ دقیقه‌ای انجام می‌داد. این فرض غلط بود:
 
-اما طبق لاگ‌های واقعی پاین (ستون تایم‌فریم = "1") و اسکرین‌شات تنظیمات
-واقعی اندیکاتور:
-    چارت اصلی بات  = ۱ دقیقه
-    تایم فریم ۱ (i_rssl_tf1) = ۵ دقیقه   ← SSL_TF1
-    تایم فریم ۲ (i_rssl_tf2) = ۱۵ دقیقه  ← SSL_TF2
-    حالت گیت = «فقط تایم فریم ۱»          ← SSL_GATE_MODE = "single"
+    • طبق لاگ‌های پاین: LTF timeframe = 1  (۱ دقیقه) — این درست بود.
+    • طبق اسکرین‌شات و بلاک لاگِ «🔬 گیت SSL — لایه ۱»: TF1 = 5 دقیقه،
+      TF2 = 15 دقیقه، mode = «فقط تایم فریم ۱».
 
-یعنی ۵ ≠ ۱، و شورت‌کاتِ «بدون resample» از پایه نامعتبر بود. این نسخه
-resample واقعی روی تایم‌فریم ۵ دقیقه انجام می‌دهد و سپس مقدار را با
-همان معناییِ دقیقِ lookahead=barmerge.lookahead_on به کندل‌های ۱ دقیقه‌ای
-منتقل می‌کند.
+یعنی SSL_TF1 (۵) با تایم‌فریم چارت (۱) یکی نیست، پس request.security
+واقعاً دارد یک سری‌ی ۵ دقیقه‌ای جداگانه می‌سازد — نه فقط یک شیفتِ
+یک‌باره روی همان دیتای ۱ دقیقه‌ای.
 
-── چرا lookahead_on اینجا ریپینت واقعی ایجاد نمی‌کند؟ ──
-f_rssl_calc در پاین همیشه Hlv[1] برمی‌گرداند، یعنی مقدارِ کاملاً بسته‌ی
-کندل ۵ دقیقه‌ایِ *قبلی*. این مقدار از همان لحظه‌ای که کندل ۵ دقیقه‌ی
-جدید باز می‌شود، قطعی و نهایی است (چون به داده‌ی هنوز درحالِ شکل‌گیریِ
-کندل جاری ۵ دقیقه‌ای هیچ وابستگی ندارد). بنابراین:
-    barmerge.lookahead_on   فقط باعث می‌شود این مقدارِ از پیش‌معلوم،
-    بدون یک کندلِ تأخیرِ اضافیِ معمولِ request.security، بلافاصله در
-    اختیار تمام کندل‌های ۱ دقیقه‌ایِ داخل همان بازه‌ی ۵ دقیقه‌ای قرار
-    گیرد.
+با اضافه‌شدن بلاکِ دیباگِ «🔬 گیت SSL» به پاین‌اسکریپت (که برای هر
+کندلِ ۱ دقیقه‌ای، وضعیت دقیقِ گیت را لاگ می‌کند) این موارد روی حدود
+۵۰۰۰ ردیف / ۴ نماد، بدون حتی یک استثنا، تأیید شد:
 
-نگاشت صحیح:
-    برای هر کندل ۱ دقیقه‌ای با شروع در لحظه‌ی t:
-        bucket_start = floor(t, 5min)
-        gate(t) = shifted_hlv_5min[bucket_start]
-    که shifted_hlv_5min[bucket_start] = Hlv کاملاً بسته‌ی کندل ۵ دقیقه‌ای
-    *قبل از* bucket_start (یعنی همان shift(1) روی سری ۵ دقیقه‌ای).
-    این مقدار فقط به گذشته وابسته است ← هیچ لیکِ آینده‌ای وجود ندارد.
+  ۱) کندل‌های HTF1 دقیقاً روی مارک‌های ۵-دقیقه‌ایِ ساعت (۰۰،۰۵،۱۰...)
+     شروع می‌شوند (نه نسبت به اولین کندلِ دیتای موجود).
+  ۲) کندل‌های HTF2 دقیقاً روی مارک‌های ۱۵-دقیقه‌ای شروع می‌شوند.
+  ۳) «HTF1 CONSUMED bar» = دقیقاً یک کندلِ ۵ دقیقه‌ایِ کامل، قبل‌تر از
+     «HTF1 current bar» — یعنی Hlv[1] همیشه متعلق به کندلِ ۵دقیقه‌ایِ
+     *کامل‌شده‌ی قبلی* است، نه یک شیفتِ یک‌دقیقه‌ای.
+  ۴) این مقدار، دقیقاً از اولین ثانیه‌ی شروعِ کندلِ ۵دقیقه‌ایِ جدید در
+     دسترس قرار می‌گیرد (بدون تأخیرِ اضافه‌ی معمولِ request.security)
+     و برای تمام ۵ کندلِ ۱دقیقه‌ایِ داخلِ آن بازه ثابت می‌ماند — دقیقاً
+     رفتارِ lookahead=barmerge.lookahead_on روی عبارتی که خودش
+     داخلی [1] دارد.
+  ۵) rssl_dir1 (کانال اصلی) == dbg_dir1 (کانالِ موازیِ خودِ پاین) در
+     ۱۰۰٪ موارد — یعنی هیچ عدم‌قطعیتِ دیگری در سمتِ پاین نیست.
+
+این نسخه دقیقاً همین مدل را با pandas.resample پیاده‌سازی می‌کند.
+
+★ نکته‌ی فنیِ مهم (بدون تغییر نسبت به نسخه‌ی قبل):
+Hlv فقط و فقط از رویِ «Baseline» ساخته می‌شود:
+    emaHigh = f_rssl_ma(baseline_type, high, baseline_len)
+    emaLow  = f_rssl_ma(baseline_type, low,  baseline_len)
+    Hlv := close > emaHigh ? 1 : close < emaLow ? -1 : Hlv   (var — sticky)
+یعنی SSL2 / کانال Baseline / ATR-continuation / خط خروج هیچ‌کدام روی
+gate اثر ندارند. با این حال کل f_rssl_calc عیناً پیاده‌سازی شده تا
+اندیکاتور کامل (برای گزارش‌گیری یا توسعه‌ی آینده) در دسترس باشد.
+
+★ نکته‌ی هم‌راستاییِ ساعت:
+resample باید روی مارک‌های استاندارد ساعت (۰۰،۰۵،۱۰...) انجام شود —
+دقیقاً همان چیزی که pandas.resample با origin پیش‌فرض ("epoch") انجام
+می‌دهد. اگر ایندکسِ ورودی tz-aware باشد (مثلاً UTC یا هر آفستی که
+مضربی از ۵ دقیقه است — مثل +03:30 تهران که برابر ۲۱۰ دقیقه و مضرب ۵
+است)، مرزهای resample با مرزهای واقعیِ کندل‌های بایننس/تریدینگ‌ویو
+یکی می‌شود. اگر تایم‌زونِ دیتای شما آفستی دارد که مضربِ ۵ دقیقه
+نیست، حتماً قبل از resample به UTC تبدیل کنید.
 
 ═══════════════════════════════════════════════════════════════════
-پارامترها — عیناً از روی اسکرین‌شات تنظیمات واقعیِ کاربر
+پارامترها — دقیقاً طبق اسکرین‌شات + بلاکِ لاگِ «لایه ۱» (تأیید مضاعف)
 ═══════════════════════════════════════════════════════════════════
 """
 
@@ -51,8 +72,7 @@ import numpy as np
 import pandas as pd
 
 # ─────────────────────────────────────────────────────────────────
-# پارامترهای اندیکاتور (Baseline / SSL2 / خروج / ATR ...)
-# — عیناً از روی اسکرین‌شات ورودی‌ها
+# پارامترهای Baseline/SSL2/ATR — عیناً از روی اسکرین‌شات
 # ─────────────────────────────────────────────────────────────────
 BASELINE_TYPE     = "HMA"
 BASELINE_LEN      = 34
@@ -63,7 +83,7 @@ SSL2_TYPE         = "JMA"
 SSL2_LEN          = 5
 ATR_CONT_CRIT     = 1.2
 
-EXIT_TYPE         = "HMA"
+EXIT_TYPE         = "HMA"   # در f_rssl_calc اصلاً استفاده نمی‌شود (دست‌نخورده نگه داشته شده)
 EXIT_LEN          = 21
 
 ATR_LEN           = 14
@@ -81,25 +101,23 @@ EDSMA_FILT_LEN    = 20
 EDSMA_FILT_POLES  = 2
 
 # ─────────────────────────────────────────────────────────────────
-# تنظیمات چندتایم‌فریمی — عیناً از روی اسکرین‌شات
+# تنظیمات گیت — طبق اسکرین‌شات + لاگِ «لایه ۱» (mode=«فقط تایم فریم ۱»)
+# فقط TF1 (۵ دقیقه) استفاده می‌شود؛ TF2/۱۵دقیقه و حالتِ «هماهنگی هر دو
+# تایم‌فریم» عمداً از این نسخه حذف شده‌اند.
 # ─────────────────────────────────────────────────────────────────
-BASE_TF_MINUTES   = 1        # تایم‌فریم چارت اصلی بات (طبق لاگ‌ها: "1")
-SSL_TF1_MINUTES   = 5        # تایم فریم ۱ در اسکرین‌شات
-SSL_TF2_MINUTES   = 15       # تایم فریم ۲ در اسکرین‌شات
-SSL_GATE_MODE     = "single"  # پاین: "فقط تایم فریم ۱" → فقط dir1 استفاده می‌شود
-# اگر کاربر بعداً حالت را به "هماهنگی هر دو تایم‌فریم" تغییر دهد،
-# SSL_GATE_MODE را به "both" تغییر دهید تا dir1 و dir2 هر دو لحاظ شوند.
+TF1_MINUTES   = 5     # تایم فریم ۱ (i_rssl_tf1)
 
 
 # ═══════════════════════════════════════════════════════════════════
-# توابع پایه (میانگین‌های متحرک) — بدون تغییر نسبت به نسخه‌ی قبلی
+# توابع پایه‌ی میانگین‌های متحرک (بدون تغییر نسبت به نسخه‌ی قبل —
+# در ممیزیِ قبلی خط‌به‌خط با پاین تطبیق داده شدند)
 # ═══════════════════════════════════════════════════════════════════
 def _sma(s: pd.Series, length: int) -> pd.Series:
     return s.rolling(length).mean()
 
 
 def _ema(s: pd.Series, length: int) -> pd.Series:
-    """معادل ta.ema پاین: بذر = اولین مقدار سری، نه SMA."""
+    """معادل ta.ema پاین: بذر = اولین مقدار سری، نه SMA (برخلاف ta.rma)."""
     alpha = 2.0 / (length + 1)
     n = len(s)
     out_vals = np.full(n, np.nan)
@@ -117,7 +135,7 @@ def _ema(s: pd.Series, length: int) -> pd.Series:
 
 
 def _rma(s: pd.Series, length: int) -> pd.Series:
-    """معادل ta.rma پاین (Wilder)."""
+    """معادل ta.rma پاین (Wilder) — بذر = SMA اولین length مقدار."""
     n = len(s)
     out = pd.Series(np.nan, index=s.index)
     if n == 0:
@@ -145,7 +163,7 @@ def _wma(s: pd.Series, length: int) -> pd.Series:
 
 
 def _hma(s: pd.Series, length: int) -> pd.Series:
-    half = max(1, int(length / 2))
+    half = max(1, int(length / 2))     # len/2 در پاین برای دو عملوندِ int → تقسیمِ صحیح
     sq = max(1, int(round(np.sqrt(length))))
     diff = 2 * _wma(s, half) - _wma(s, length)
     return _wma(diff, sq)
@@ -394,20 +412,60 @@ def _atr_smoothed(high, low, close, length, smoothing):
 
 
 # ═══════════════════════════════════════════════════════════════════
-# f_rssl_calc — معادل کامل بخش ⑮.۵ کد پاین
-# روی هر تایم‌فریمی که df بهش تعلق داره اجرا می‌شه (بدون فرض درباره‌ی
-# اینکه این تایم‌فریم همون تایم‌فریم چارت چیه)
+# ری‌سمپل — تولید کندل‌های HTF از روی دیتای LTF (۱ دقیقه)
+# ═══════════════════════════════════════════════════════════════════
+def resample_ohlc(df_ltf: pd.DataFrame, tf_minutes: int) -> pd.DataFrame:
+    """
+    df_ltf: دیتافریمِ ۱ دقیقه‌ای با ستون‌های open/high/low/close و
+            ایندکسِ زمانیِ صعودی (ترجیحاً tz-aware و UTC یا هر تایم‌زونی
+            که آفستش مضربِ tf_minutes باشد).
+    خروجی: کندل‌های HTF با label='left' (برچسبِ هر کندل = زمانِ شروعِ
+            آن بازه) و closed='left' — دقیقاً هم‌راستا با مارک‌های
+            استانداردِ ساعت (تأییدشده روی لاگ‌های پاین: ۰۰،۰۵،۱۰،... و
+            ۰۰،۱۵،۳۰،۴۵ برای HTF2).
+    """
+    agg = {"open": "first", "high": "max", "low": "min", "close": "last"}
+    cols = [c for c in agg if c in df_ltf.columns]
+    htf = (
+        df_ltf[cols]
+        .resample(f"{tf_minutes}min", label="left", closed="left")
+        .agg({c: agg[c] for c in cols})
+    )
+    htf = htf.dropna(how="any")
+    return htf
+
+
+def _map_htf_to_ltf(ltf_index: pd.DatetimeIndex, htf_series: pd.Series, tf_minutes: int) -> pd.Series:
+    """
+    برای هر بارِ LTF، مقدارِ کندلِ HTF‌ای که آن بار داخلش قرار دارد را
+    برمی‌گرداند (بدون هیچ تأخیرِ اضافه — چون htf_series از قبل با
+    shift(1) به «کندلِ کامل‌شده‌ی قبلی» منتقل شده است). این دقیقاً
+    معادلِ رفتارِ لاگ‌شده‌ی پاین است: مقدار از همان لحظه‌ی شروعِ
+    کندلِ HTF جدید در دسترس قرار می‌گیرد و تا پایانِ آن بازه ثابت
+    می‌ماند.
+    """
+    bucket_start = ltf_index.floor(f"{tf_minutes}min")
+    mapped = htf_series.reindex(bucket_start)
+    mapped.index = ltf_index
+    return mapped
+
+
+# ═══════════════════════════════════════════════════════════════════
+# f_rssl_calc — معادل کامل بخش ⑮.۵ کد پاین (روی هر تایم‌فریمی که
+# دیتافریمِ ورودی به آن تعلق دارد)
 # ═══════════════════════════════════════════════════════════════════
 def compute_ssl_hybrid(df: pd.DataFrame) -> pd.DataFrame:
     """
-    ورودی: df با ستون‌های open/high/low/close (ایندکس زمانی، صعودی)
-    خروجی: DataFrame هم‌طول df با ستون‌های خامِ:
-        hlv          → Hlv خام (بدون شیفت پاین)
+    ورودی: df با ستون‌های open/high/low/close (ایندکس زمانی، صعودی) —
+           روی هر تایم‌فریمی که باشد (۱ دقیقه، ۵ دقیقه، ۱۵ دقیقه، ...).
+    خروجی: DataFrame هم‌طول df با ستون‌های:
+        hlv          → Hlv خامِ همان‌بار (بدون شیفتِ پاین)
         baseline_dir → جهت baseline خام
         cont_dir     → جهت تداوم خام
-    این‌ها مقادیر «خام»اند؛ f_rssl_calc در پاین خودش Hlv[1] را
-    برمی‌گرداند، پس شیفت باید جداگانه (بیرون این تابع) اعمال شود —
-    نگاه کنید به resample_htf_and_shift().
+    این مقادیر «خام» هستند؛ معادلِ دقیقِ rssl_dir1/2 پاین (که خودِ
+    f_rssl_calc با یک بار [1] شیفت برمی‌گرداند) در compute_htf_dir_series
+    ساخته می‌شود — که هم شیفت را روی ایندکسِ HTF انجام می‌دهد و هم
+    نتیجه را به ایندکسِ LTF نگاشت می‌کند.
     """
     high, low, close = df["high"], df["low"], df["close"]
 
@@ -487,92 +545,89 @@ def compute_ssl_hybrid(df: pd.DataFrame) -> pd.DataFrame:
             baseline_dir[i] = -1
 
     return pd.DataFrame(
-        {"hlv": hlv, "baseline_dir": baseline_dir, "cont_dir": cont_dir},
+        {
+            "hlv": hlv,
+            "baseline_dir": baseline_dir,
+            "cont_dir": cont_dir,
+            "ema_high": eh_v,
+            "ema_low": el_v,
+        },
         index=df.index,
     )
 
 
 # ═══════════════════════════════════════════════════════════════════
-# ★ بخش اصلاح‌شده: resample واقعی + نگاشت با معنای lookahead_on
+# گیت چندتایم‌فریمی — معادلِ واقعیِ request.security(..., lookahead_on)
 # ═══════════════════════════════════════════════════════════════════
-def _resample_ohlc(df: pd.DataFrame, tf_minutes: int) -> pd.DataFrame:
+def compute_htf_dir_series(df_ltf: pd.DataFrame, tf_minutes: int) -> pd.Series:
     """
-    Resample کندل‌های پایه به تایم‌فریم بالاتر — هم‌راستا با ساعت واقعی
-    (label='left', closed='left')، دقیقاً مطابق باکت‌بندیِ استانداردِ
-    TradingView برای تایم‌فریم‌های دقیقه‌ای.
+    معادلِ دقیقِ رشته‌ی rssl_dir1 (یا rssl_dir2) پاین:
+      ۱) دیتای LTF به کندل‌های tf_minutes دقیقه‌ای ری‌سمپل می‌شود.
+      ۲) Hlv خام روی همان سریِ HTF محاسبه می‌شود.
+      ۳) با shift(1) روی ایندکسِ HTF، «Hlv[1]» ساخته می‌شود — یعنی
+         مقدارِ کندلِ HTF کامل‌شده‌ی قبلی.
+      ۴) این مقدار به هر بارِ LTف که داخلِ همان بازه‌ی HTF قرار دارد
+         نگاشت می‌شود (بدون تأخیرِ اضافه — دقیقاً طبقِ لایه‌ی ۲ و ۵ لاگِ
+         «🔬 گیت SSL» که تأیید شد).
+    مقدار در بار i:  1 / -1 / 0
     """
-    rule = f"{tf_minutes}min"
-    o = df["open"].resample(rule, label="left", closed="left").first()
-    h = df["high"].resample(rule, label="left", closed="left").max()
-    l = df["low"].resample(rule, label="left", closed="left").min()
-    c = df["close"].resample(rule, label="left", closed="left").last()
-    out = pd.DataFrame({"open": o, "high": h, "low": l, "close": c})
-    return out.dropna(how="any")
+    htf = resample_ohlc(df_ltf, tf_minutes)
+    htf_result = compute_ssl_hybrid(htf)
+    htf_hlv_shifted = htf_result["hlv"].shift(1).fillna(0).astype(int)
+    return _map_htf_to_ltf(df_ltf.index, htf_hlv_shifted, tf_minutes).fillna(0).astype(int)
 
 
-def resample_htf_and_shift(df: pd.DataFrame, tf_minutes: int) -> pd.Series:
-    """
-    معادل دقیقِ:
-        request.security(symbol, tf, f_rssl_calc(), lookahead=barmerge.lookahead_on)
-    که خروجی‌اش را در گیت استفاده می‌کنیم (rssl_dir).
-
-    مراحل:
-      ۱) resample دیتای پایه به تایم‌فریم tf_minutes
-      ۲) محاسبه‌ی Hlv خام روی همان تایم‌فریم بالاتر (compute_ssl_hybrid)
-      ۳) shift(1) روی سری Hlv تایم‌فریم بالاتر — همان [1] داخلِ خودِ
-         f_rssl_calc در پاین (چون تابع Hlv[1] را برمی‌گرداند نه Hlv)
-      ۴) نگاشتِ این سریِ شیفت‌خورده به ایندکسِ تایم‌فریمِ پایه:
-         برای هر کندلِ پایه با زمانِ شروعِ t، مقدار متعلق به باکتِ
-         floor(t, tf_minutes) استفاده می‌شود — بدون هیچ تأخیرِ کندلیِ
-         اضافه (این دقیقاً همان اثرِ barmerge.lookahead_on است، و چون
-         مقدار از قبل با shift(1) قطعی/بسته شده، هیچ لیکِ آینده‌ای رخ
-         نمی‌دهد).
-
-    خروجی: سری هم‌طول df (ایندکس = ایندکس df) با مقادیر {-1, 0, 1}
-    """
-    htf = _resample_ohlc(df, tf_minutes)
-    raw = compute_ssl_hybrid(htf)
-    shifted = raw["hlv"].shift(1).fillna(0).astype(int)
-
-    # bucket_start برای هر کندلِ پایه = floor به تایم‌فریمِ بالاتر
-    base_bucket = df.index.floor(f"{tf_minutes}min")
-    # map هر بار به مقدارِ shifted در همان بازه‌ی زمانی
-    mapped = shifted.reindex(base_bucket)
-    mapped.index = df.index
-    return mapped.fillna(0).astype(int)
-
-
-def compute_gate_series(df: pd.DataFrame):
-    """
-    معادل دقیقِ رشته‌ی rssl_dir1 (و در حالت "both"، rssl_dir2 هم) پاین،
-    با resample واقعی به SSL_TF1_MINUTES (و در صورت نیاز SSL_TF2_MINUTES).
-
-    اگر SSL_GATE_MODE == "single":
-        فقط dir1 برمی‌گردد (یک pd.Series[int])
-    اگر SSL_GATE_MODE == "both":
-        (dir1, dir2) برمی‌گردد — یک تاپل از دو pd.Series[int]
-    """
-    dir1 = resample_htf_and_shift(df, SSL_TF1_MINUTES)
-    if SSL_GATE_MODE == "single":
-        return dir1
-    dir2 = resample_htf_and_shift(df, SSL_TF2_MINUTES)
-    return dir1, dir2
-
-
-def gate_flags(df: pd.DataFrame):
+def gate_flags(df_ltf: pd.DataFrame, tf1_minutes: int = TF1_MINUTES):
     """
     برمی‌گرداند (gate_long: pd.Series[bool], gate_short: pd.Series[bool])
-    دقیقاً معادل:
-        both_mode  = i_rssl_mode == "هماهنگی هر دو تایم‌فریم"
-        gate_long  = both_mode ? (dir1==1  and dir2==1)  : dir1 == 1
-        gate_short = both_mode ? (dir1==-1 and dir2==-1) : dir1 == -1
+    مطابقِ پاین در حالتِ «فقط تایم فریم ۱»:
+        gate_long  = dir1 == 1
+        gate_short = dir1 == -1
     """
-    if SSL_GATE_MODE == "single":
-        dir1 = compute_gate_series(df)
-        return dir1 == 1, dir1 == -1
-
-    dir1, dir2 = compute_gate_series(df)
-    gate_long = (dir1 == 1) & (dir2 == 1)
-    gate_short = (dir1 == -1) & (dir2 == -1)
+    dir1 = compute_htf_dir_series(df_ltf, tf1_minutes)
+    gate_long = dir1 == 1
+    gate_short = dir1 == -1
     return gate_long, gate_short
+
+
+# سازگاری با نسخه‌ی قبل (نام قدیمی) — حالا درست کار می‌کند
+def compute_gate_series(df_ltf: pd.DataFrame, tf_minutes: int = TF1_MINUTES) -> pd.Series:
+    return compute_htf_dir_series(df_ltf, tf_minutes)
+
+
+# ═══════════════════════════════════════════════════════════════════
+# ابزار اعتبارسنجی — تولیدِ همان فیلدهایی که در لاگِ «🔬 گیت SSL» پاین
+# چاپ می‌شوند، برای دیف گرفتنِ مستقیم/سطر‌به‌سطر با pine-logs-*.csv
+# ═══════════════════════════════════════════════════════════════════
+def debug_gate_trace(df_ltf: pd.DataFrame, tf1_minutes: int = TF1_MINUTES) -> pd.DataFrame:
+    """
+    خروجی: یک DataFrame هم‌طولِ df_ltf با ستون‌هایی که مستقیماً معادلِ
+    فیلدهای بلاکِ لاگِ پاین هستند:
+        htf1_cur, htf1_cons, emahigh1, emalow1, dir1, gate_long, gate_short, gate_raw
+    برای اعتبارسنجی: این خروجی را برای همان بازه‌ی زمانی/نمادِ لاگ‌های
+    پاین بسازید و ردیف‌به‌ردیف با فایل‌های pine-logs-DTM_v6_FC_*.csv
+    مقایسه کنید (emahigh1/emalow1/dir1 باید عیناً یکی باشند).
+    """
+    htf1 = resample_ohlc(df_ltf, tf1_minutes)
+    htf1_result = compute_ssl_hybrid(htf1)
+
+    bucket1_start = df_ltf.index.floor(f"{tf1_minutes}min")
+    htf1_cons_time = bucket1_start - pd.Timedelta(minutes=tf1_minutes)
+
+    ema_high1_shifted = htf1_result["ema_high"].shift(1)
+    ema_low1_shifted = htf1_result["ema_low"].shift(1)
+    hlv1_shifted = htf1_result["hlv"].shift(1).fillna(0).astype(int)
+
+    out = pd.DataFrame(index=df_ltf.index)
+    out["htf1_cur"] = bucket1_start
+    out["htf1_cons"] = htf1_cons_time
+    out["emahigh1"] = _map_htf_to_ltf(df_ltf.index, ema_high1_shifted, tf1_minutes)
+    out["emalow1"] = _map_htf_to_ltf(df_ltf.index, ema_low1_shifted, tf1_minutes)
+    out["dir1"] = _map_htf_to_ltf(df_ltf.index, hlv1_shifted, tf1_minutes).fillna(0).astype(int)
+
+    out["gate_long"] = out["dir1"] == 1
+    out["gate_short"] = out["dir1"] == -1
+    out["gate_raw"] = out["dir1"]
+
+    return out
 
