@@ -3,4 +3,5 @@ numpy
 pandas
 flask
 pynesys-pynecore==6.8.14
+matplotlib
 #pynesys-pynecore[cli]
