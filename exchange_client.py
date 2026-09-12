@@ -42,9 +42,23 @@ logger = logging.getLogger("exchange")
 # ─────────────────────────────────────────────────────────────────
 # تنظیمات نمادها
 # ─────────────────────────────────────────────────────────────────
-TICK_SIZES = {"LTCUSDT": 0.01, "DOGEUSDT": 0.00001, "ETHUSDT": 0.01}
-LEVERAGE_MAP = {"LTCUSDT": 75, "DOGEUSDT": 75, "ETHUSDT": 50}
-SYMBOLS = ["LTCUSDT", "DOGEUSDT", "ETHUSDT"]
+TICK_SIZES = {
+    "LTCUSDT": 0.01,
+    "DOGEUSDT": 0.00001,
+    "ETHUSDT": 0.01,
+    "ARBUSDT": 0.0001,      
+}
+
+LEVERAGE_MAP = {
+    "LTCUSDT": 75,
+    "DOGEUSDT": 75,
+    "ETHUSDT": 50,
+    "ARBUSDT": 75,         
+}
+
+SYMBOLS = ["LTCUSDT", "DOGEUSDT", "ETHUSDT", "ARBUSDT"]
+
+
 
 
 def _precision_from_tick(tick: float) -> int:
