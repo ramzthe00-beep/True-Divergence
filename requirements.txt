@@ -2,6 +2,6 @@ requests
 numpy
 pandas
 flask
-pynesys-pynecore==6.8.14
+pynesys-pynecore==6.9.2
 matplotlib
 #pynesys-pynecore[cli]
