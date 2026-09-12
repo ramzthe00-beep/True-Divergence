@@ -432,8 +432,8 @@ class DivergenceEngine:
         events: List[LabelEvent] = []
         events += self._scan_divergence(df, high, low, close, rsi_v, macd_line, macd_hist,
                                           trending, pivot_high, pivot_low, gate_dir)
-        events += self._scan_ma_cross(df, ma_f, ma_m, ma_s, gate_dir)
-
+        
+        # events += self._scan_ma_cross(df, ma_f, ma_m, ma_s, gate_dir)
         events.sort(key=lambda e: e.bar_index)
         return events
 
