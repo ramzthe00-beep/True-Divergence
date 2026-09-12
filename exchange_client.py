@@ -111,21 +111,12 @@ class MarketData:
     # ------------------------------------------------------------------
     # منبع سیگنال: بایننس (عمومی)
     # ------------------------------------------------------------------
-    def fetch_ohlcv_binance(self, symbol: str, timeframe: str = "1", timeout: int = 8) -> pd.DataFrame:
+    def fetch_ohlcv_binance(self, symbol: str, timeframe: str = "1") -> pd.DataFrame:
         """
         timeframe به‌سبکِ عددِ خامِ دقیقه ("1","5","15",...) پذیرفته می‌شود
         تا با بقیه‌ی پروژه (و main.py) هماهنگ بماند؛ داخلاً به فرمت
         interval بایننس ("1m","5m",...) ترجمه می‌شود.
         """
-        # ─── cache بایننس (۳۰ ثانیه) ───
-        if not hasattr(self, "_binance_cache"):
-            self._binance_cache = {}
-        now_ts = time.time()
-        cache_key = f"{symbol.upper()}_{timeframe}"
-        cached = self._binance_cache.get(cache_key)
-        if cached and (now_ts - cached[1]) < self._BINANCE_CACHE_TTL_SEC:
-            return cached[0]
-
         interval_map = {"1": "1m", "5": "5m", "15": "15m", "30": "30m", "60": "1h", "240": "4h"}
         interval = interval_map.get(str(timeframe), f"{timeframe}m")
 
@@ -150,7 +141,7 @@ class MarketData:
                     f"{base}/api/v3/klines?symbol={symbol.upper()}"
                     f"&interval={interval}&startTime={start_ms}&endTime={now_ms}&limit={limit}"
                 )
-                r = self.session.get(url, timeout=timeout)
+                r = self.session.get(url, timeout=15)
                 r.raise_for_status()
                 rows = r.json()
                 if not rows:
@@ -178,7 +169,6 @@ class MarketData:
 
                 self._binance_base_working = base   # کش کن تا دفعه‌ی بعد مستقیم همین base را بزند
                 result = df.tail(self.history_bars)
-                self._binance_cache[cache_key] = (result, now_ts)   # ← ذخیره در cache
                 logger.info(f"Fetched {len(result)} BINANCE-SPOT candles for {symbol} {timeframe}m via {base}")
                 return result
 
@@ -197,8 +187,7 @@ class MarketData:
     # ------------------------------------------------------------------
     # منبع اجرا: خودِ صرافیِ مقصد (UDF)
     # ------------------------------------------------------------------
-    def fetch_ohlcv(self, symbol: str, timeframe: str = "1", bars_limit: Optional[int] = None,
-                    timeout: int = 5) -> pd.DataFrame:
+    def fetch_ohlcv(self, symbol: str, timeframe: str = "1", bars_limit: Optional[int] = None) -> pd.DataFrame:
         """
         bars_limit: برای فراخوانی‌هایی که فقط چند کندلِ آخر لازم دارند
         (مثل fetch_current_price) — تا درخواست غیرضروریِ ۵۰۰ کندلی به
@@ -220,7 +209,7 @@ class MarketData:
         )
 
         try:
-            r = self.session.get(f"{self.base_url}{uri}", timeout=timeout)
+            r = self.session.get(f"{self.base_url}{uri}", timeout=20)
             if r.status_code == 429:
                 logger.warning(f"[RATE-LIMIT] 429 for {symbol} {timeframe}m — backing off")
                 time.sleep(2)
@@ -258,8 +247,7 @@ class MarketData:
     # کش کوتاه‌مدتِ قیمت لحظه‌ای — تا در یک چرخهٔ تحلیل (analyze_and_execute)
     # اگر چند نقطه از کد قیمتِ همان نماد را بخواهند (مثلاً هم track_open_trades
     # و هم process_symbol)، فقط یک درخواست واقعی به صرافی زده شود.
-    _PRICE_CACHE_TTL_SEC = 90.0   # ← افزایش از ۵ به ۹۰ ثانیه (کمتر درخواست)
-    _BINANCE_CACHE_TTL_SEC = 30.0   # ← cache برای fetch_ohlcv_binance
+    _PRICE_CACHE_TTL_SEC = 5.0
 
     def fetch_current_price(self, symbol: str) -> Optional[float]:
         """قیمت لحظه‌ای برای لنگرِ اجرا — از خودِ صرافیِ مقصد (نه بایننس)،
@@ -274,28 +262,11 @@ class MarketData:
         if cached and (now - cached[1]) < self._PRICE_CACHE_TTL_SEC:
             return cached[0]
 
-        # ─── تلاش با retry (بر اساس df خالی، نه exception) ───
-        # توجه: fetch_ohlcv خودش exception رو می‌گیره و DataFrame خالی برمی‌گردونه
-        # پس باید بر اساس df.empty تصمیم بگیریم، نه try/except
-        max_retries = 2
-        for attempt in range(max_retries):
-            df = self.fetch_ohlcv(symbol, "1", bars_limit=3, timeout=5)
-            if df is not None and not df.empty:
-                price = float(df["close"].iloc[-1])
-                self._price_cache[symbol.upper()] = (price, now)
-                return price
-            # df خالی → احتمالاً timeout بوده → retry
-            if attempt < max_retries - 1:
-                logger.warning(f"[PRICE] {symbol}: خالی برگشت (تلاش {attempt+1}/{max_retries}) — retry...")
-                time.sleep(1)
-                continue
-            logger.warning(f"[PRICE] {symbol}: پس از {max_retries} تلاش خالی برگشت")
-
-        # ─── fallback: cache قدیمی ───
-        if cached:
-            logger.warning(f"[PRICE] {symbol}: از cache قدیمی استفاده شد ({now - cached[1]:.0f}s قبل)")
-            return cached[0]
-
+        df = self.fetch_ohlcv(symbol, "1", bars_limit=3)
+        if df is not None and not df.empty:
+            price = float(df["close"].iloc[-1])
+            self._price_cache[symbol.upper()] = (price, now)
+            return price
         return None
 
 

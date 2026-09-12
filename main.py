@@ -68,7 +68,7 @@ if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
 STATE_FILE = "engine_state.json"
 HISTORY_FILE = "trades_history.json"
 HISTORY_BARS = 500          # کندل‌های ۱ دقیقه‌ای برای هر چرخه‌ی تحلیل
-LOOP_SLEEP_SEC = 30   # ← کاهش از ۶۰ به ۳۰ (cache 30s + چرخه 30s)
+LOOP_SLEEP_SEC = 60
 SIGNAL_TIMEFRAME = "1"      # ← فرمتِ جدید: عددِ خامِ دقیقه (نه "1m")
 
 # ── تنظیمات معاملاتی (خارج از دامنه‌ی «تطابق ۱۰۰٪ با پاین») ──────────
