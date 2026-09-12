@@ -26,32 +26,6 @@ telegram_logger.py است.
 درخواست صریح کاربر، تنها بخش‌هایی که باید عیناً با پاین یکی باشند
 divergence_engine.py و ssl_hybrid.py هستند. اینجا صرفاً زیرساخت دریافت
 داده و اجرای معامله پیاده شده است.
-
-═══════════════════════════════════════════════════════════════════
-🔧 پچِ پاریتیِ ۱۲ سپتامبر — «کندلِ بسته‌نشده» (تنها تغییرِ این نسخه)
-═══════════════════════════════════════════════════════════════════
-divergence_engine.py صراحتاً قرارداد گذاشته که process() باید فقط با
-کندل‌های *بسته‌شده* فراخوانی شود (بدون کندلِ جاری/باز). قبل از این پچ،
-هم fetch_ohlcv_binance (endTime=now_ms) و هم fetch_ohlcv (to=now) کندلِ
-در-حال-شکل‌گیریِ آخر را هم برمی‌گرداندند. چون LOOP_SLEEP_SEC=60 با مرزِ
-کندلِ ۱ دقیقه‌ای هم‌زمان نیست، این تقریباً هر چرخه رخ می‌داد — و چون
-last_pivot_scan_ts در divergence_engine هرگز عقب برنمی‌گردد، خطا موقتی
-نبود: آن پوزیشن دیگر هرگز با مقدارِ نهاییِ همان کندل دوباره اسکن
-نمی‌شد. نتیجه: پیوت/RSI/MACD/فیبو/گیت گاهی روی دادهٔ ناقص محاسبه
-می‌شدند و رویدادِ واگرایی با آنچه پاین (روی کندل‌های واقعاً بسته) لاگ
-می‌کند فرق می‌کرد.
-
-راه‌حل: هر دو متد اکنون قبل از بازگرداندنِ دیتافریم، کندلِ آخر را اگر
-هنوز بسته نشده باشد حذف می‌کنند:
-  • fetch_ohlcv_binance: با closeTime واقعیِ خودِ کندل (row[6] از پاسخِ
-    /api/v3/klines) — دقیق‌ترین حالت ممکن، چون بایننس مدتِ کندل را
-    مستقیماً برمی‌گرداند.
-  • fetch_ohlcv (UDF): چون این endpoint فقط زمانِ بازِ کندل (t) را
-    می‌دهد نه closeTime را، بسته‌بودن از رویِ «open_time + مدتِ کندل ≤
-    الان» محاسبه می‌شود.
-  • fetch_current_price همچنان از fetch_ohlcv(bars_limit=3) بدونِ این
-    فیلتر استفاده می‌کند — آنجا قیمتِ لحظه‌ای/زنده دقیقاً همان چیزی است
-    که باید باشد (لنگرِ اجرای واقعی)، نه ورودیِ موتورِ واگرایی.
 """
 
 import hashlib
@@ -174,18 +148,6 @@ class MarketData:
                     logger.warning(f"Binance: no candles for {symbol} {timeframe}m")
                     return pd.DataFrame()
 
-                # ═══ پچِ پاریتی: حذفِ کندلِ باز/بسته‌نشده ═══
-                # هر ردیفِ کلاینِ بایننس به‌صورت
-                # [openTime, o, h, l, c, v, closeTime, ...] است.
-                # اگر closeTime هنوز نگذشته باشد، آن کندل قطعاً کاملاً
-                # بسته نشده — دقیقاً همان کندلی که divergence_engine.py
-                # صراحتاً نباید ببیند.
-                closed_rows = [row for row in rows if row[6] < now_ms]
-                if not closed_rows:
-                    logger.warning(f"Binance: no CLOSED candles yet for {symbol} {timeframe}m")
-                    return pd.DataFrame()
-                rows = closed_rows
-
                 t = [row[0] / 1000.0 for row in rows]
                 o = [row[1] for row in rows]
                 h = [row[2] for row in rows]
@@ -207,7 +169,7 @@ class MarketData:
 
                 self._binance_base_working = base   # کش کن تا دفعه‌ی بعد مستقیم همین base را بزند
                 result = df.tail(self.history_bars)
-                logger.info(f"Fetched {len(result)} BINANCE-SPOT CLOSED candles for {symbol} {timeframe}m via {base}")
+                logger.info(f"Fetched {len(result)} BINANCE-SPOT candles for {symbol} {timeframe}m via {base}")
                 return result
 
             except Exception as e:
@@ -231,11 +193,6 @@ class MarketData:
         (مثل fetch_current_price) — تا درخواست غیرضروریِ ۵۰۰ کندلی به
         صرافی زده نشود. اگر داده نشود، رفتار قبلی (self.history_bars)
         حفظ می‌شود؛ هیچ فراخوانیِ موجودِ دیگری تحت تأثیر قرار نمی‌گیرد.
-
-        نکته‌ی پچِ پاریتی: فقط وقتی bars_limit=None است (یعنی مسیرِ
-        اصلیِ fallback برای divergence_engine، نه fetch_current_price)
-        کندلِ بسته‌نشده حذف می‌شود — چون fetch_current_price عمداً
-        قیمتِ زنده را می‌خواهد.
         """
         try:
             multiplier = int(timeframe)
@@ -278,21 +235,6 @@ class MarketData:
             df = df.sort_index()
             df = df[~df.index.duplicated(keep="last")]
             df = df.dropna(subset=["open", "high", "low", "close"])
-
-            # ═══ پچِ پاریتی: حذفِ کندلِ باز/بسته‌نشده ═══
-            # این endpoint (بر خلافِ بایننس) closeTime نمی‌دهد؛ فقط
-            # زمانِ بازِ کندل (t) در دسترس است. پس بسته‌بودن را از رویِ
-            # «زمانِ باز + مدتِ کندل ≤ الان» محاسبه می‌کنیم. فقط برای
-            # مسیرِ سیگنال (bars_limit=None) اعمال می‌شود؛
-            # fetch_current_price(bars_limit=3) عمداً دست‌نخورده می‌ماند.
-            if bars_limit is None and len(df) > 0:
-                bar_seconds = multiplier * 60
-                last_open_ts = df.index[-1].timestamp()
-                if last_open_ts + bar_seconds > now:
-                    df = df.iloc[:-1]
-                    if df.empty:
-                        logger.warning(f"Exchange: no CLOSED candles yet for {symbol} {timeframe}m")
-                        return pd.DataFrame()
 
             result = df.tail(limit)
             logger.info(f"Fetched {len(result)} exchange candles for {symbol} {timeframe}m")
@@ -397,11 +339,16 @@ class PrivateExchange:
         نماد رند می‌شوند؛ اگر بعد از رند صفر/نامعتبر شد، از بدنه حذف می‌شود
         تا خطای صرافی نگیریم.
         برمی‌گرداند: dict نتیجه صرافی، یا ExchangeError پرتاب می‌کند.
+
+        ⚠️ فقط "LONG" یا "SHORT" پذیرفته می‌شود — اگر مقدار دیگری برسد
+        (مثل "BUY"/"SELL")، ExchangeError پرتاب می‌شود تا اشتباهات
+        پنهان نمانند و دقیقاً همان چیزی که صرافی انتظار دارد ارسال شود.
         """
-        # صرافی فقط LONG/SHORT را می‌شناسد — اگر BUY/SELL رسید، نگاشت کن
-        # تا از خطای "Failed to parse request body" جلوگیری شود.
-        side_map = {"BUY": "LONG", "SELL": "SHORT", "LONG": "LONG", "SHORT": "SHORT"}
-        normalized_side = side_map.get(side.upper(), side.upper())
+        normalized_side = str(side).upper().strip()
+        if normalized_side not in ("LONG", "SHORT"):
+            raise ExchangeError(
+                f"Invalid side '{side}' — only 'LONG' or 'SHORT' are accepted."
+            )
 
         prec = PRICE_PRECISION.get(symbol.upper(), 2)
         order_data = {
@@ -437,4 +384,3 @@ class PrivateExchange:
         if take_profit is not None:
             body["takeProfit"] = f"{self._round_price(take_profit, symbol):.{prec}f}"
         return self._request("PATCH", f"/futures/positions/{position_id}/tpsl", body)
-
