@@ -151,19 +151,27 @@ def _rma(series: pd.Series, length: int) -> pd.Series:
 
 
 def _ema(series: pd.Series, length: int) -> pd.Series:
-    """معادل ta.ema پاین: seed = اولین مقدارِ معتبر (نه SMA). این دقیقاً
-    رفتار خودِ پاین است؛ نکته‌ی مهم: چون EMA بی‌نهایت-حافظه است، اگر
-    دیتافریمِ ورودی کاملِ تاریخچه‌ی نمادِ موردنظر از لحظه‌ی شروعِ چارت
-    نباشد، seed این تابع با seedِ واقعیِ پاین (که از همان اولین کندلِ
-    نماد شروع شده) یکی نخواهد بود؛ اما با گذشتِ چند صد کندل این اختلاف
-    عملاً به صفر میل می‌کند. توصیه: همیشه process() را با کاملِ
-    تاریخچه‌ی موجود صدا بزنید، نه فقط پنجره‌ی اخیر."""
+    """معادل دقیق ta.ema پاین در PyneCore 6.9.2:
+       - seed = SMA روی اولین length مقدار معتبر
+       - step = prev + alpha * (source - prev)  ← ترتیب float مهم"""
     alpha = 2.0 / (length + 1)
     n = len(series)
     out = np.full(n, np.nan)
-    fv = series.first_valid_index()
-    if fv is None:
-        return pd.Series(out, index=series.index)
+    vals = series.to_numpy(dtype=float)
+    for i in range(length - 1, n):
+        window = vals[i - length + 1:i + 1]
+        if np.isnan(window).any():
+            continue
+        prev = window.mean()
+        out[i] = prev
+        for j in range(i + 1, n):
+            if np.isnan(vals[j]):
+                out[j] = np.nan
+                continue
+            prev = prev + alpha * (vals[j] - prev)
+            out[j] = prev
+        break
+    return pd.Series(out, index=series.index)
     pos0 = series.index.get_loc(fv)
     vals = series.to_numpy(dtype=float).copy()
     prev = vals[pos0]
@@ -246,8 +254,11 @@ def find_pivot_high(high: pd.Series, left=PIVOT_LEFT, right=PIVOT_RIGHT) -> pd.S
     out = pd.Series(np.nan, index=high.index)
     h = high.to_numpy(dtype=float)
     for i in range(left, n - right):
-        if not (h[i - left:i] >= h[i]).any() and not (h[i + 1:i + right + 1] >= h[i]).any():
-            out.iloc[i] = h[i]
+        if (h[i - left:i] > h[i]).any():
+            continue
+        if (h[i + 1:i + right + 1] >= h[i]).any():
+            continue
+        out.iloc[i] = h[i]
     return out
 
 
@@ -256,8 +267,11 @@ def find_pivot_low(low: pd.Series, left=PIVOT_LEFT, right=PIVOT_RIGHT) -> pd.Ser
     out = pd.Series(np.nan, index=low.index)
     l = low.to_numpy(dtype=float)
     for i in range(left, n - right):
-        if not (l[i - left:i] <= l[i]).any() and not (l[i + 1:i + right + 1] <= l[i]).any():
-            out.iloc[i] = l[i]
+        if (l[i - left:i] < l[i]).any():
+            continue
+        if (l[i + 1:i + right + 1] <= l[i]).any():
+            continue
+        out.iloc[i] = l[i]
     return out
 
 

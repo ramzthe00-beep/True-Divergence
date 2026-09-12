@@ -117,13 +117,27 @@ def _sma(s: pd.Series, length: int) -> pd.Series:
 
 
 def _ema(s: pd.Series, length: int) -> pd.Series:
-    """معادل ta.ema پاین: بذر = اولین مقدار سری، نه SMA (برخلاف ta.rma)."""
+    """معادل دقیق ta.ema پاین در PyneCore 6.9.2:
+       - seed = SMA روی اولین length مقدار معتبر
+       - step = prev + alpha * (source - prev)  ← ترتیب float مهم"""
     alpha = 2.0 / (length + 1)
     n = len(s)
-    out_vals = np.full(n, np.nan)
-    fv = s.first_valid_index()
-    if fv is None:
-        return pd.Series(out_vals, index=s.index)
+    out = np.full(n, np.nan)
+    vals = s.to_numpy(dtype=float)
+    for i in range(length - 1, n):
+        window = vals[i - length + 1:i + 1]
+        if np.isnan(window).any():
+            continue
+        prev = window.mean()
+        out[i] = prev
+        for j in range(i + 1, n):
+            if np.isnan(vals[j]):
+                out[j] = np.nan
+                continue
+            prev = prev + alpha * (vals[j] - prev)
+            out[j] = prev
+        break
+    return pd.Series(out, index=s.index)
     pos0 = s.index.get_loc(fv)
     vals = s.to_numpy(dtype=float).copy()
     prev = vals[pos0]
@@ -135,11 +149,11 @@ def _ema(s: pd.Series, length: int) -> pd.Series:
 
 
 def _rma(s: pd.Series, length: int) -> pd.Series:
-    """معادل ta.rma پاین (Wilder) — بذر = SMA اولین length مقدار."""
+    """معادل ta.rma پاین (Wilder). seed = SMA اولین length مقدار معتبر."""
     n = len(s)
-    out = pd.Series(np.nan, index=s.index)
+    out_vals = np.full(n, np.nan)
     if n == 0:
-        return out
+        return pd.Series(out_vals, index=s.index)
     alpha = 1.0 / length
     vals = s.to_numpy(dtype=float)
     lead = 0
@@ -147,9 +161,8 @@ def _rma(s: pd.Series, length: int) -> pd.Series:
         lead += 1
     seed_idx = lead + length - 1
     if seed_idx >= n:
-        return out
+        return pd.Series(out_vals, index=s.index)
     prev = vals[lead:seed_idx + 1].mean()
-    out_vals = out.to_numpy(dtype=float)
     out_vals[seed_idx] = prev
     for i in range(seed_idx + 1, n):
         prev = alpha * vals[i] + (1 - alpha) * prev
