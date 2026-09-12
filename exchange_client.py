@@ -312,9 +312,14 @@ class PrivateExchange:
         تا خطای صرافی نگیریم.
         برمی‌گرداند: dict نتیجه صرافی، یا ExchangeError پرتاب می‌کند.
         """
+        # صرافی فقط LONG/SHORT را می‌شناسد — اگر BUY/SELL رسید، نگاشت کن
+        # تا از خطای "Failed to parse request body" جلوگیری شود.
+        side_map = {"BUY": "LONG", "SELL": "SHORT", "LONG": "LONG", "SHORT": "SHORT"}
+        normalized_side = side_map.get(side.upper(), side.upper())
+
         prec = PRICE_PRECISION.get(symbol.upper(), 2)
         order_data = {
-            "symbol": symbol.upper(), "side": side.upper(), "tradeType": "MARKET",
+            "symbol": symbol.upper(), "side": normalized_side, "tradeType": "MARKET",
             "leverage": int(leverage), "cost": f"{capital:.{prec}f}", "walletType": "debit",
         }
         if stop_loss is not None:
@@ -346,4 +351,5 @@ class PrivateExchange:
         if take_profit is not None:
             body["takeProfit"] = f"{self._round_price(take_profit, symbol):.{prec}f}"
         return self._request("PATCH", f"/futures/positions/{position_id}/tpsl", body)
+
 
