@@ -359,7 +359,7 @@ def process_symbol(symbol, engine: de.DivergenceEngine):
 
         if exchange.connected:
             try:
-                side = "BUY" if event.direction == "BUY" else "SELL"
+                side = "LONG" if event.direction == "BUY" else "SHORT"
                 result = exchange.create_order(symbol, side, capital, int(used_lev), stop, target)
                 trade["position_id"] = result.get("position_id")
                 save_history(history)
@@ -430,4 +430,5 @@ def health():
 if __name__ == "__main__":
     threading.Thread(target=lambda: app.run(host="0.0.0.0", port=10000), daemon=True).start()
     main_loop()
+
 
