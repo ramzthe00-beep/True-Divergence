@@ -187,22 +187,33 @@ class MarketData:
     # ------------------------------------------------------------------
     # منبع اجرا: خودِ صرافیِ مقصد (UDF)
     # ------------------------------------------------------------------
-    def fetch_ohlcv(self, symbol: str, timeframe: str = "1") -> pd.DataFrame:
+    def fetch_ohlcv(self, symbol: str, timeframe: str = "1", bars_limit: Optional[int] = None) -> pd.DataFrame:
+        """
+        bars_limit: برای فراخوانی‌هایی که فقط چند کندلِ آخر لازم دارند
+        (مثل fetch_current_price) — تا درخواست غیرضروریِ ۵۰۰ کندلی به
+        صرافی زده نشود. اگر داده نشود، رفتار قبلی (self.history_bars)
+        حفظ می‌شود؛ هیچ فراخوانیِ موجودِ دیگری تحت تأثیر قرار نمی‌گیرد.
+        """
         try:
             multiplier = int(timeframe)
         except (TypeError, ValueError):
             multiplier = 1
 
+        limit = bars_limit if bars_limit else self.history_bars
         now = int(time.time())
-        bars_needed = self.history_bars * multiplier * 2
+        bars_needed = limit * multiplier * 2
         from_ts = now - bars_needed * 60 - 60
         uri = (
             f"/futures/udf/history?symbol={symbol.upper()}&resolution={timeframe}"
-            f"&from={from_ts}&to={now}&countback={self.history_bars * multiplier}"
+            f"&from={from_ts}&to={now}&countback={limit * multiplier}"
         )
 
         try:
             r = self.session.get(f"{self.base_url}{uri}", timeout=20)
+            if r.status_code == 429:
+                logger.warning(f"[RATE-LIMIT] 429 for {symbol} {timeframe}m — backing off")
+                time.sleep(2)
+                return pd.DataFrame()
             r.raise_for_status()
             data = r.json()
 
@@ -225,7 +236,7 @@ class MarketData:
             df = df[~df.index.duplicated(keep="last")]
             df = df.dropna(subset=["open", "high", "low", "close"])
 
-            result = df.tail(self.history_bars)
+            result = df.tail(limit)
             logger.info(f"Fetched {len(result)} exchange candles for {symbol} {timeframe}m")
             return result
 
@@ -233,12 +244,29 @@ class MarketData:
             logger.error(f"[FETCH] {symbol} ({timeframe}): {e}")
             return pd.DataFrame()
 
+    # کش کوتاه‌مدتِ قیمت لحظه‌ای — تا در یک چرخهٔ تحلیل (analyze_and_execute)
+    # اگر چند نقطه از کد قیمتِ همان نماد را بخواهند (مثلاً هم track_open_trades
+    # و هم process_symbol)، فقط یک درخواست واقعی به صرافی زده شود.
+    _PRICE_CACHE_TTL_SEC = 5.0
+
     def fetch_current_price(self, symbol: str) -> Optional[float]:
         """قیمت لحظه‌ای برای لنگرِ اجرا — از خودِ صرافیِ مقصد (نه بایننس)،
-        چون این قیمت باید دقیقاً همان چیزی باشد که سفارش رویش اجرا می‌شود."""
-        df = self.fetch_ohlcv(symbol, "1")
+        چون این قیمت باید دقیقاً همان چیزی باشد که سفارش رویش اجرا می‌شود.
+        فقط چند کندلِ آخر گرفته می‌شود (نه کل تاریخچه) تا فشارِ غیرضروری
+        روی endpoint صرافی و ریسکِ 429 کاهش یابد؛ نتیجه چند ثانیه کش می‌شود."""
+        if not hasattr(self, "_price_cache"):
+            self._price_cache: Dict[str, Tuple[float, float]] = {}
+
+        now = time.time()
+        cached = self._price_cache.get(symbol.upper())
+        if cached and (now - cached[1]) < self._PRICE_CACHE_TTL_SEC:
+            return cached[0]
+
+        df = self.fetch_ohlcv(symbol, "1", bars_limit=3)
         if df is not None and not df.empty:
-            return float(df["close"].iloc[-1])
+            price = float(df["close"].iloc[-1])
+            self._price_cache[symbol.upper()] = (price, now)
+            return price
         return None
 
 
