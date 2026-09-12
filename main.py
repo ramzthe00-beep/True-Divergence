@@ -84,6 +84,11 @@ MIN_COLLATERAL_USDT = float(os.getenv("MIN_COLLATERAL_USDT", "1"))
 STOP_BUFFER_TICKS = 5
 CROSS_ATR_STOP_MULT = 2.0
 
+# ── فرمول محاسبهٔ سرمایه (مبنای ۲ دلار) ──────────────────────────────
+CAPITAL_BASE_USDT = 2.0                 # B — مبلغ مبنا (همیشه ۲ دلار)
+DEFAULT_LEVERAGE = 50                   # اگر نمادی در ex.LEVERAGE_MAP نبود
+BALANCE_FALLBACK_RATIO = 0.70           # وقتی موجودی کافی نبود
+
 notifier = TelegramNotifier(TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID, logger=logger)
 market = ex.MarketData(BASE_URL, history_bars=HISTORY_BARS)
 exchange = ex.PrivateExchange(API_KEY, API_SECRET, BASE_URL)
@@ -166,6 +171,97 @@ def compute_stop_target(event: de.LabelEvent, entry_price: float, atr_now: float
         return stop, target
 
     return None, None
+
+
+# ═══════════════════════════════════════════════════════════════════
+# محاسبهٔ سرمایه — فرمول کامل بر اساس مبنای ۲ دلار
+# ═══════════════════════════════════════════════════════════════════
+def calculate_capital_plan(symbol: str, stop_pct_frac: float, target_pct_frac, balance: float):
+    """
+    stop_pct_frac / target_pct_frac: کسر (fraction) هستند، یعنی مثلاً
+    ۰.۰۰۰۶۹ برای ۰.۰۶۹٪ — دقیقاً همان چیزی که در کد قبلی به‌صورت
+    stop_pct = abs(entry-stop)/entry محاسبه می‌شد.
+
+    مهم: اهرمِ (L) استفاده‌شده در فرمول، اهرمِ *واقعیِ* همان نماد است
+    (هرچه در ex.LEVERAGE_MAP برای آن نماد ثبت شده — مثلاً ۵۰، ۷۵، ۲۰۰
+    یا هر عددِ دیگری) — نه یک لیستِ ثابتِ فرضی. یعنی هر نماد با اهرمِ
+    خودش محاسبه می‌شود و دقیقاً همان اهرم هم برای اجرای معامله استفاده
+    خواهد شد.
+    """
+    if stop_pct_frac is None or stop_pct_frac <= 0:
+        return None  # درصد استاپ باید > ۰ باشد — جلوگیری از تقسیم بر صفر
+
+    L = ex.LEVERAGE_MAP.get(symbol)
+    if not L or L <= 0:
+        L = DEFAULT_LEVERAGE
+
+    S = stop_pct_frac * 100.0                 # درصد استاپ (مثلاً ۰.۰۶۹)
+    old_leverage = 1.0 / stop_pct_frac         # اهرم قدیمی = ۱ ÷ (S ÷ ۱۰۰)
+
+    if old_leverage > L:
+        required_capital = CAPITAL_BASE_USDT * (old_leverage / L)
+    else:
+        required_capital = CAPITAL_BASE_USDT
+
+    if balance >= required_capital:
+        final_capital = required_capital
+        status = "کامل"
+    else:
+        final_capital = balance * BALANCE_FALLBACK_RATIO
+        status = f"{int(BALANCE_FALLBACK_RATIO * 100)}٪"
+
+    profit_usdt = None
+    R = None
+    if target_pct_frac is not None and target_pct_frac > 0:
+        T = target_pct_frac * 100.0
+        profit_usdt = CAPITAL_BASE_USDT * (T / S)
+        R = T / S
+    loss_usdt = CAPITAL_BASE_USDT
+
+    return {
+        "symbol": symbol,
+        "stop_pct": S,
+        "target_pct": (target_pct_frac * 100.0) if target_pct_frac else None,
+        "leverage": L,                     # اهرمِ همین نماد — همان که در فرمول به‌کار رفت
+        "old_leverage": old_leverage,
+        "required_capital": required_capital,
+        "final_capital": final_capital,
+        "status": status,
+        "profit_usdt": profit_usdt,
+        "loss_usdt": loss_usdt,
+        "R": R,
+        "balance": balance,
+    }
+
+
+def format_capital_report(plan: dict, signal_number=None) -> str:
+    """خلاصهٔ کامل محاسباتِ سرمایه برای ارسال به تلگرام."""
+    if plan is None:
+        return "⚠️ محاسبهٔ سرمایه ممکن نشد (درصد استاپ نامعتبر بود)."
+
+    tag = f" #Signal_{signal_number}" if signal_number else ""
+    lines = [
+        f"🧮 *خلاصهٔ محاسبهٔ سرمایه* — `{plan['symbol']}`{tag}",
+        "━━━━━━━━━━━━━━━━━━━━━━",
+        f"درصد استاپ (S): `{plan['stop_pct']:.4f}٪`",
+        f"اهرمِ نماد (L): `{plan['leverage']}x`",
+        f"اهرم قدیمی: `{plan['old_leverage']:.2f}`",
+        f"موجودی فعلی (M): `{plan['balance']:.2f}` USDT",
+    ]
+    if plan["target_pct"] is not None:
+        lines.append(f"درصد تارگت (T): `{plan['target_pct']:.4f}٪`")
+
+    lines.append("━━━━━━━━━━━━━━━━━━━━━━")
+    lines.append(f"سرمایهٔ موردنیاز: `{plan['required_capital']:.2f}` USDT")
+    lines.append(f"سرمایهٔ نهایی: `{plan['final_capital']:.2f}` USDT ({plan['status']})")
+
+    lines.append("━━━━━━━━━━━━━━━━━━━━━━")
+    lines.append(f"🛑 ضرر دلاری (ثابت): `{plan['loss_usdt']:.2f}` USDT")
+    if plan["profit_usdt"] is not None:
+        lines.append(f"🎯 سود دلاری: `{plan['profit_usdt']:.2f}` USDT")
+        lines.append(f"⚖️ نسبت R (ریسک به ریوارد): `{plan['R']:.2f}`")
+    lines.append(f"🕒 {format_iran_time()}")
+    return "\n".join(lines)
 
 
 # ═══════════════════════════════════════════════════════════════════
@@ -359,30 +455,19 @@ def process_symbol(symbol, engine: de.DivergenceEngine):
 
         prec = ex.PRICE_PRECISION.get(symbol, 2)
         stop_pct = abs(entry_price - stop) / entry_price
-        leverage = ex.LEVERAGE_MAP.get(symbol, 50)
-        needed_lev = 1.0 / stop_pct if stop_pct > 0 else leverage
-        used_lev = min(needed_lev, leverage)
-        required_capital = TARGET_RISK_USDT / stop_pct / used_lev if stop_pct > 0 else TARGET_RISK_USDT
+        target_pct = abs(target - entry_price) / entry_price if target is not None else None
 
-        if required_capital < MIN_COLLATERAL_USDT:
-            # سرمایهٔ محاسبه‌شده (ریسک‌محور) کمتر از حداقلِ مجازِ صرافی است.
-            # برای حفظِ همان ریسکِ هدف (TARGET_RISK_USDT) به‌جای بالا بردنِ
-            # صرفِ سرمایه، ابتدا تلاش می‌کنیم لوریج را متناسب پایین بیاوریم
-            # (capital × leverage × stop_pct باید ثابت بماند):
-            #   adjusted_lev = TARGET_RISK_USDT / (MIN_COLLATERAL_USDT × stop_pct)
-            adjusted_lev = TARGET_RISK_USDT / (MIN_COLLATERAL_USDT * stop_pct) if stop_pct > 0 else used_lev
-            if adjusted_lev >= 1:
-                used_lev = min(adjusted_lev, leverage)
-                required_capital = MIN_COLLATERAL_USDT
-            else:
-                # حتی با لوریجِ ۱x هم نگه‌داشتنِ ریسکِ هدف با حداقلِ سرمایه
-                # ممکن نیست — به‌جای ردشدنِ کاملِ سفارش، حداقلِ سرمایه با
-                # لوریجِ ۱x فرستاده می‌شود (ریسکِ واقعی کمی بیش از هدف
-                # خواهد بود، اما این بهتر از یک 400 تضمینی است).
-                used_lev = 1
-                required_capital = MIN_COLLATERAL_USDT
+        plan = calculate_capital_plan(symbol, stop_pct, target_pct, balance)
 
-        capital = required_capital if balance >= required_capital else balance * 0.98
+        # ── ارسالِ خلاصهٔ کاملِ محاسباتِ سرمایه به تلگرام برای هر سیگنال ──
+        notifier.send(format_capital_report(plan, signal_number))
+
+        if plan is None:
+            logger.warning(f"[CAPITAL] {symbol}: درصد استاپ نامعتبر بود — سیگنال #{signal_number} رد شد.")
+            continue
+
+        used_lev = plan["leverage"]
+        capital = plan["final_capital"]
 
         trade = {
             "symbol": symbol, "direction": event.direction,
