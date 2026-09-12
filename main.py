@@ -74,6 +74,13 @@ SIGNAL_TIMEFRAME = "1"      # ← فرمتِ جدید: عددِ خامِ دقی�
 # ── تنظیمات معاملاتی (خارج از دامنه‌ی «تطابق ۱۰۰٪ با پاین») ──────────
 TARGET_RISK_USDT = 3.5
 TARGET_RR = 3.0
+MIN_COLLATERAL_USDT = float(os.getenv("MIN_COLLATERAL_USDT", "1"))
+# ↑ حداقلِ سرمایهٔ (cost) قابل‌قبول برای هر پوزیشن روی TheTrueTrade — طبق
+# اطلاعِ خودِ کاربر ۱ USDT است. با این عدد، اصلاحِ زیر عملاً همان چیزی
+# را حل می‌کند که واقعاً اتفاق افتاده بود: وقتی موجودیِ حساب کمتر از
+# TARGET_RISK_USDT (۳.۵) باشد، خط «capital = balance * 0.98» می‌تواند
+# عددی زیر همین ۱ دلار بسازد — و همان رد می‌شده. اگر صرافی عددِ دیگری
+# اعلام کرد، با متغیر محیطی MIN_COLLATERAL_USDT تنظیمش کنید.
 STOP_BUFFER_TICKS = 5
 CROSS_ATR_STOP_MULT = 2.0
 
@@ -316,6 +323,17 @@ def process_symbol(symbol, engine: de.DivergenceEngine):
     history = load_history()
 
     for event in events:
+        # ── رویدادهای «صرفاً اطلاع‌رسانی» (اجرای اول برنامه) اصلاً به قیمتِ
+        #    لحظه‌ایِ صرافیِ اجرا نیاز ندارند — فقط پیام نمایشی ارسال می‌شود
+        #    و هیچ معامله‌ای باز نمی‌شود؛ پس بدون تماسِ اضافی با صرافی رد شو.
+        #    (رفعِ باگِ قبلی: تماسِ سنگین با /futures/udf/history برای هر
+        #    رویدادِ تاریخیِ استارت، که باعثِ 429 Too Many Requests می‌شد.) ──
+        if _first_run:
+            send_signal_message(
+                symbol, event, df_signal, event.price_at_signal, None, None, informational=True
+            )
+            continue
+
         # ── لنگرِ قیمتِ ورودِ واقعی: از خودِ صرافیِ اجرا (TheTrueTrade)،
         #    نه از قیمتِ بایننس در لحظه‌ی رویداد — چون سفارش واقعاً روی
         #    همان صرافی اجرا می‌شود و قیمت بازار می‌تواند کمی فرق داشته باشد.
@@ -332,7 +350,7 @@ def process_symbol(symbol, engine: de.DivergenceEngine):
         atr_now = float(atr_series.iloc[event.bar_index]) if not pd.isna(atr_series.iloc[event.bar_index]) else 0.0
         stop, target = compute_stop_target(event, entry_price, atr_now, symbol)
 
-        if _first_run or stop is None or target is None:
+        if stop is None or target is None:
             send_signal_message(symbol, event, df_signal, entry_price, stop, target, informational=True)
             continue
 
@@ -345,6 +363,25 @@ def process_symbol(symbol, engine: de.DivergenceEngine):
         needed_lev = 1.0 / stop_pct if stop_pct > 0 else leverage
         used_lev = min(needed_lev, leverage)
         required_capital = TARGET_RISK_USDT / stop_pct / used_lev if stop_pct > 0 else TARGET_RISK_USDT
+
+        if required_capital < MIN_COLLATERAL_USDT:
+            # سرمایهٔ محاسبه‌شده (ریسک‌محور) کمتر از حداقلِ مجازِ صرافی است.
+            # برای حفظِ همان ریسکِ هدف (TARGET_RISK_USDT) به‌جای بالا بردنِ
+            # صرفِ سرمایه، ابتدا تلاش می‌کنیم لوریج را متناسب پایین بیاوریم
+            # (capital × leverage × stop_pct باید ثابت بماند):
+            #   adjusted_lev = TARGET_RISK_USDT / (MIN_COLLATERAL_USDT × stop_pct)
+            adjusted_lev = TARGET_RISK_USDT / (MIN_COLLATERAL_USDT * stop_pct) if stop_pct > 0 else used_lev
+            if adjusted_lev >= 1:
+                used_lev = min(adjusted_lev, leverage)
+                required_capital = MIN_COLLATERAL_USDT
+            else:
+                # حتی با لوریجِ ۱x هم نگه‌داشتنِ ریسکِ هدف با حداقلِ سرمایه
+                # ممکن نیست — به‌جای ردشدنِ کاملِ سفارش، حداقلِ سرمایه با
+                # لوریجِ ۱x فرستاده می‌شود (ریسکِ واقعی کمی بیش از هدف
+                # خواهد بود، اما این بهتر از یک 400 تضمینی است).
+                used_lev = 1
+                required_capital = MIN_COLLATERAL_USDT
+
         capital = required_capital if balance >= required_capital else balance * 0.98
 
         trade = {
@@ -354,6 +391,26 @@ def process_symbol(symbol, engine: de.DivergenceEngine):
             "type": event.kind, "capital": capital, "leverage": int(used_lev),
             "signal_number": signal_number, "position_id": None, "risk_free_done": False,
         }
+
+        if capital < MIN_COLLATERAL_USDT:
+            # حتی موجودیِ حسابِ فیوچرز هم برای حداقلِ سرمایهٔ مجاز صرافی کافی
+            # نیست — به‌جای ارسالِ سفارشی که مطمئناً با همان خطای
+            # «Collateral is below the minimum allowed» رد می‌شود، از همین‌جا
+            # صرف‌نظر می‌کنیم و شفاف اطلاع می‌دهیم.
+            trade["result"] = "SKIPPED_INSUFFICIENT_BALANCE"
+            history.append(trade)
+            save_history(history)
+            logger.warning(
+                f"[SKIP-ORDER] {symbol}: موجودی ({balance:.2f} USDT) کمتر از حداقلِ سرمایهٔ لازم "
+                f"({MIN_COLLATERAL_USDT} USDT) است — سفارش ارسال نشد."
+            )
+            notifier.send(
+                f"⚠️ *سفارش ارسال نشد* — `{symbol}` #{signal_number}\n"
+                f"موجودی کافی برای حداقلِ سرمایهٔ مجازِ صرافی ({MIN_COLLATERAL_USDT:.2f} USDT) وجود ندارد.\n"
+                f"🕒 {format_iran_time()}"
+            )
+            continue
+
         history.append(trade)
         save_history(history)
 
