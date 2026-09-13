@@ -32,6 +32,14 @@ main.py — DTM v6·FC Bot (نسخه‌ی اصلاح‌شده — سازگار �
        • لنگرِ قیمتِ ورود/اجرا از market.fetch_current_price(...) که خودِ
          TheTrueTrade است (چون سفارش واقعاً رویِ آن صرافی اجرا می‌شود و
          قیمتِ ورودِ واقعی باید مالِ همان بازار باشد، نه بایننس).
+
+  ۳) بافرِ استاپ per-symbol شد (قبلاً یک عدد ثابت برای همه بود):
+       • DOGEUSDT: tick × 2
+       • BNBUSDT:  tick × 2
+       • LTCUSDT:  tick × 1
+       • ARBUSDT:  tick × 1
+       • ETHUSDT:  tick × 5
+       • پیش‌فرض (نماد جدید): tick × 3
 """
 
 import os
@@ -81,6 +89,7 @@ MIN_COLLATERAL_USDT = float(os.getenv("MIN_COLLATERAL_USDT", "1"))
 # TARGET_RISK_USDT (۳.۵) باشد، خط «capital = balance * 0.98» می‌تواند
 # عددی زیر همین ۱ دلار بسازد — و همان رد می‌شده. اگر صرافی عددِ دیگری
 # اعلام کرد، با متغیر محیطی MIN_COLLATERAL_USDT تنظیمش کنید.
+
 # ─── بافر استاپ per-symbol (تعداد تیک) ───
 # A = tick × 1  (نزدیک‌ترین به پیوت)
 # B = tick × 2  (کمی امن‌تر)
@@ -93,7 +102,7 @@ STOP_BUFFER_TICKS_MAP = {
     "ARBUSDT":  1,   # A
     "ETHUSDT":  5,   # D
 }
-STOP_BUFFER_TICKS_DEFAULT = 3   # پیش فرض برای نماد های جدید
+STOP_BUFFER_TICKS_DEFAULT = 3   # پیش‌فرض نمادهای جدید (C)
 
 CROSS_ATR_STOP_MULT = 2.0
 
@@ -587,5 +596,3 @@ def health():
 if __name__ == "__main__":
     threading.Thread(target=lambda: app.run(host="0.0.0.0", port=10000), daemon=True).start()
     main_loop()
-
-
