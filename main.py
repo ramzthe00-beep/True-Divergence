@@ -81,7 +81,20 @@ MIN_COLLATERAL_USDT = float(os.getenv("MIN_COLLATERAL_USDT", "1"))
 # TARGET_RISK_USDT (۳.۵) باشد، خط «capital = balance * 0.98» می‌تواند
 # عددی زیر همین ۱ دلار بسازد — و همان رد می‌شده. اگر صرافی عددِ دیگری
 # اعلام کرد، با متغیر محیطی MIN_COLLATERAL_USDT تنظیمش کنید.
-STOP_BUFFER_TICKS = 5
+# ─── بافر استاپ per-symbol (تعداد تیک) ───
+# A = tick × 1  (نزدیک‌ترین به پیوت)
+# B = tick × 2  (کمی امن‌تر)
+# C = tick × 3  (پیش‌فرض نمادهای جدید)
+# D = tick × 5  (محافظه‌کارانه)
+STOP_BUFFER_TICKS_MAP = {
+    "DOGEUSDT": 2,   # B
+    "BNBUSDT":  2,   # B
+    "LTCUSDT":  1,   # A
+    "ARBUSDT":  1,   # A
+    "ETHUSDT":  5,   # D
+}
+STOP_BUFFER_TICKS_DEFAULT = 3   # پیش فرض برای نماد های جدید
+
 CROSS_ATR_STOP_MULT = 2.0
 
 # ── فرمول محاسبهٔ سرمایه (مبنای ۲ دلار) ──────────────────────────────
@@ -138,7 +151,9 @@ def save_history(h):
 # ═══════════════════════════════════════════════════════════════════
 def compute_stop_target(event: de.LabelEvent, entry_price: float, atr_now: float, symbol: str):
     tick = ex.TICK_SIZES.get(symbol.upper(), 0.01)
-    buf = tick * STOP_BUFFER_TICKS
+    # ─── بافر per-symbol ───
+    ticks_count = STOP_BUFFER_TICKS_MAP.get(symbol.upper(), STOP_BUFFER_TICKS_DEFAULT)
+    buf = tick * ticks_count
 
     if event.kind in ("CLASSIC_BEARISH_DIV", "HIDDEN_BEARISH_DIV"):
         highest_peak = max(event.ref_price_1, event.ref_price_2)
