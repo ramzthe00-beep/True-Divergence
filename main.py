@@ -390,19 +390,6 @@ def track_open_trades():
             t["close_time"] = format_iran_time()
             changed = True
             notifier.send(f"💔 *حد ضرر فعال شد* — `{symbol}` #{t.get('signal_number','?')}\n🕒 {format_iran_time()}")
-        elif exchange.connected and not t.get("risk_free_done") and t.get("position_id"):
-            risk_dist = abs(entry - stop)
-            if risk_dist > 0:
-                hit_1r = (cp >= entry + risk_dist) if direction == "BUY" else (cp <= entry - risk_dist)
-                if hit_1r:
-                    try:
-                        exchange.update_position_sl(t["position_id"], symbol, entry, take_profit=target)
-                        t["risk_free_done"] = True
-                        t["stop"] = entry
-                        changed = True
-                        notifier.send(f"🛡️ *ریسک‌فری فعال شد* — `{symbol}` #{t.get('signal_number','?')}\n🕒 {format_iran_time()}")
-                    except Exception as e:
-                        logger.error(f"[RISK-FREE] {symbol}: {e}")
     if changed:
         save_history(history)
 
