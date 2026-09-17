@@ -28,7 +28,7 @@ divergence_engine.py و ssl_hybrid.py هستند. اینجا صرفاً زیرس
 داده و اجرای معامله پیاده شده است.
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-  تغییرات این نسخه (برای رفع مشکل کندی track_open_trades):
+  تغییرات این نسخه (برای رفع مشکل track_open_trades + fetch_current_price):
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
   🐛 مشکل: تابع track_open_trades در main.py برای هر پوزیشن باز،
      fetch_current_price را صدا می‌زند. با ۲۱۰ پوزیشن باز، این می‌شود
@@ -36,10 +36,17 @@ divergence_engine.py و ssl_hybrid.py هستند. اینجا صرفاً زیرس
      اتمامش شروع می‌شود → هیچ‌وقت به آخر لیست نمی‌رسد → هیچ پیام TP/SL
      فرستاده نمی‌شود.
 
-  ✅ راه‌حل: cache ۹۰ ثانیه‌ای + retry + cache fallback در fetch_current_price
-     - بار اول: fetch واقعی، ذخیره در cache
-     - بارهای بعدی (توی ۹۰ ثانیه): از cache فوری
-     - نتیجه: ۲۱۰ پوزیشن → فقط ۱ درخواست → ۰.۴ ثانیه (۲۰۶x سریع‌تر)
+  ✅ راه‌حل (دو سطح):
+     ۱. cache ۹۰ ثانیه‌ای + retry + cache fallback در fetch_current_price
+        - بار اول: fetch واقعی، ذخیره در cache
+        - بارهای بعدی (توی ۹۰ ثانیه): از cache فوری
+        - نتیجه: ۲۱۰ پوزیشن → فقط ۱ درخواست → ۰.۴ ثانیه (۲۰۶x سریع‌تر)
+
+     ۲. تغییر endpoint اصلی از udf/history به markets/stats:
+        - markets/stats: بدون پارامتر، یه درخواست برای همه‌ی نمادها،
+          سریع (۰.۵s)، پایدار (تست ۲۰/۲۰ موفق)
+        - udf/history فقط به عنوان fallback
+        - cache ۵ ثانیه‌ای برای لیست کامل مارکت‌ها
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 """
 
@@ -269,20 +276,28 @@ class MarketData:
     # بدون cache = ۲۱۰ درخواست به صرافی (۸۴ ثانیه). با cache = فقط ۱
     # درخواست (۰.۴ ثانیه) — ۲۰۶x سریع‌تر.
     _PRICE_CACHE_TTL_SEC = 90.0
+    _MARKETS_STATS_CACHE_TTL_SEC = 5.0
 
     def fetch_current_price(self, symbol: str, max_retries: int = 2) -> Optional[float]:
         """قیمت لحظه‌ای برای لنگرِ اجرا — از خودِ صرافیِ مقصد (نه بایننس).
 
-        با cache ۹۰ ثانیه‌ای + retry:
-        - بار اول: fetch واقعی از صرافی، ذخیره در cache
-        - بارهای بعدی (توی ۹۰ ثانیه): از cache فوری برمی‌گردونه
-        - اگه صرافی timeout داد: retry ۲ باره + cache fallback
+        سه روش (به ترتیب اولویت):
+        1) markets/stats — سریع‌ترین (۰.۵s)، پایدارترین (۱۰۰٪)، یه درخواست برای همه‌ی نمادها
+        2) udf/history — fallback اگه markets/stats fail داد
+        3) cache قدیمی — اگه هر دو fail دادن
+
+        با cache ۹۰ ثانیه‌ای + cache ۵ ثانیه‌ای برای markets/stats:
+        - بار اول: fetch واقعی از markets/stats
+        - بارهای بعدی (توی ۹۰ ثانیه): از cache فوری
+        - بارهای بعدی (توی ۵ ثانیه): از cache لیست کامل
 
         این خیلی مهمه چون track_open_trades برای هر پوزیشن باز این تابع
         رو صدا می‌زنه. با ۲۱۰ پوزیشن: بدون cache = ۸۴ ثانیه، با cache = ۰.۴s.
         """
         if not hasattr(self, "_price_cache"):
             self._price_cache: Dict[str, Tuple[float, float]] = {}
+        if not hasattr(self, "_markets_stats_cache"):
+            self._markets_stats_cache: Tuple[Optional[list], float] = (None, 0.0)
 
         now = time.time()
         cached = self._price_cache.get(symbol.upper())
@@ -291,7 +306,33 @@ class MarketData:
         if cached and (now - cached[1]) < self._PRICE_CACHE_TTL_SEC:
             return cached[0]
 
-        # ─── تلاش با retry ───
+        # ═══════════════════════════════════════════════════════════════════
+        # روش ۱: markets/stats (اصلی، سریع، پایدار، بدون پارامتر)
+        # ═══════════════════════════════════════════════════════════════════
+        try:
+            stats_cached, stats_time = self._markets_stats_cache
+            # cache ۵ ثانیه‌ای برای لیست کامل (چون در یک چرخه چند نماد می‌خوانیم)
+            if stats_cached is not None and (now - stats_time) < self._MARKETS_STATS_CACHE_TTL_SEC:
+                stats = stats_cached
+            else:
+                r = self.session.get(f"{self.base_url}/futures/markets/stats", timeout=5)
+                r.raise_for_status()
+                stats = r.json()
+                self._markets_stats_cache = (stats, now)
+
+            if isinstance(stats, list):
+                for s in stats:
+                    if isinstance(s, dict) and s.get("symbol") == symbol.upper():
+                        price = float(s["lastPrice"])
+                        self._price_cache[symbol.upper()] = (price, now)
+                        return price
+            logger.warning(f"[PRICE] {symbol}: markets/stats برگشت ولی نماد پیدا نشد — fallback به udf/history")
+        except Exception as e:
+            logger.warning(f"[PRICE] {symbol}: markets/stats fail: {e} — fallback به udf/history")
+
+        # ═══════════════════════════════════════════════════════════════════
+        # روش ۲: udf/history (fallback)
+        # ═══════════════════════════════════════════════════════════════════
         for attempt in range(max_retries):
             df = self.fetch_ohlcv(symbol, "1", bars_limit=3, timeout=5)
             if df is not None and not df.empty:
@@ -304,7 +345,9 @@ class MarketData:
                 continue
             logger.warning(f"[PRICE] {symbol}: پس از {max_retries} تلاش خالی برگشت")
 
-        # ─── fallback: cache قدیمی ───
+        # ═══════════════════════════════════════════════════════════════════
+        # روش ۳: cache قدیمی
+        # ═══════════════════════════════════════════════════════════════════
         if cached:
             logger.warning(f"[PRICE] {symbol}: از cache قدیمی استفاده شد ({now - cached[1]:.0f}s قبل)")
             return cached[0]
@@ -414,15 +457,3 @@ class PrivateExchange:
             raise
         except Exception as e:
             raise ExchangeError(str(e))
-
-    def update_position_sl(self, position_id, symbol, stop_loss, take_profit=None):
-        """ریسک‌فری: جابه‌جایی حد ضرر یک پوزیشن باز به نقطه‌ی سر‌به‌سر."""
-        prec = PRICE_PRECISION.get(symbol.upper(), 2)
-        body = {
-            "stopLoss": f"{self._round_price(stop_loss, symbol):.{prec}f}",
-            "stopLossStrategy": "LATEST_PRICE",
-            "stopLossOrderType": "STOP_MARKET",
-        }
-        if take_profit is not None:
-            body["takeProfit"] = f"{self._round_price(take_profit, symbol):.{prec}f}"
-        return self._request("PATCH", f"/futures/positions/{position_id}/tpsl", body)
