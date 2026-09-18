@@ -40,6 +40,14 @@ main.py — DTM v6·FC Bot (نسخه‌ی اصلاح‌شده — سازگار �
        • ARBUSDT:  tick × 1
        • ETHUSDT:  tick × 5
        • پیش‌فرض (نماد جدید): tick × 3
+
+  ۴) 🆕 پیوت‌ها از صرافی خوانده می‌شوند (نه بایننس):
+     موتور تشخیص (بایننس) زمان پیوت ۱ و پیوت ۲ را در LabelEvent ذخیره
+     می‌کند (pivot_ts_1_ms و pivot_ts_2_ms). این فایل، برای هر رویداد،
+     همان زمان‌ها را به market.get_price_at_time می‌دهد تا high/low
+     متناظر از صرافی TheTrueTrade استخراج شود. نتیجه: stop/target با
+     قیمت واقعیِ صرافی محاسبه می‌شود که با چارت صرافی هم‌خوان است.
+     اگر صرافی پاسخ نداد، fallback به قیمت بایننس انجام می‌شود.
 """
 
 import os
@@ -453,6 +461,52 @@ def process_symbol(symbol, engine: de.DivergenceEngine):
                 f"[ANCHOR] {symbol}: قیمتِ لحظه‌ایِ صرافیِ اجرا در دسترس نبود — "
                 f"از قیمتِ بایننس ({event.price_at_signal}) به‌عنوان جایگزین استفاده شد."
             )
+
+        # ═══════════════════════════════════════════════════════════════════
+        # 🆕 جدید: گرفتن قیمت پیوت‌ها از صرافی در زمان‌های بایننس
+        # ═══════════════════════════════════════════════════════════════════
+        # منطق: موتور تشخیص (روی بایننس) پیوت‌های واگرایی را در زمان‌های
+        # مشخصی تشخیص می‌دهد و pivot_ts_1_ms/pivot_ts_2_ms را در event
+        # ذخیره می‌کند. اینجا همان زمان‌ها را به صرافی می‌دهیم تا high/low
+        # متناظر از صرافی TheTrueTrade استخراج شود. نتیجه: stop/target با
+        # قیمت واقعیِ صرافی محاسبه می‌شود، نه با قیمت بایننس — که با آنچه
+        # کاربر در چارت صرافی می‌بیند هم‌خوان است.
+        #
+        # برای LONG: از low صرافی استفاده می‌شود (پایین‌ترین دره)
+        # برای SHORT: از high صرافی استفاده می‌شود (بالاترین قله)
+        # اگر صرافی پاسخ نداد، fallback خودکار به قیمت بایننس انجام می‌شود.
+        price_type = "low" if "BULLISH" in event.kind else "high"
+
+        if event.pivot_ts_1_ms:
+            ref_1_ex = market.get_price_at_time(symbol, event.pivot_ts_1_ms, price_type)
+            if ref_1_ex is not None:
+                logger.info(
+                    f"[PIVOT-EX] {symbol}: پیوت ۱ صرافی = {ref_1_ex:.6f} "
+                    f"(بایننس: {event.ref_price_1:.6f})"
+                )
+                event.ref_price_1 = ref_1_ex
+            else:
+                logger.warning(
+                    f"[PIVOT-EX] {symbol}: پیوت ۱ صرافی نیومد — "
+                    f"از بایننس ({event.ref_price_1:.6f}) استفاده شد"
+                )
+
+        if event.pivot_ts_2_ms:
+            ref_2_ex = market.get_price_at_time(symbol, event.pivot_ts_2_ms, price_type)
+            if ref_2_ex is not None:
+                logger.info(
+                    f"[PIVOT-EX] {symbol}: پیوت ۲ صرافی = {ref_2_ex:.6f} "
+                    f"(بایننس: {event.ref_price_2:.6f})"
+                )
+                event.ref_price_2 = ref_2_ex
+            else:
+                logger.warning(
+                    f"[PIVOT-EX] {symbol}: پیوت ۲ صرافی نیومد — "
+                    f"از بایننس ({event.ref_price_2:.6f}) استفاده شد"
+                )
+        # ═══════════════════════════════════════════════════════════════════
+        # پایان بخش جدید
+        # ═══════════════════════════════════════════════════════════════════
 
         atr_now = float(atr_series.iloc[event.bar_index]) if not pd.isna(atr_series.iloc[event.bar_index]) else 0.0
         stop, target = compute_stop_target(event, entry_price, atr_now, symbol)
