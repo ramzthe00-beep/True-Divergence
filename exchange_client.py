@@ -47,6 +47,13 @@ divergence_engine.py و ssl_hybrid.py هستند. اینجا صرفاً زیرس
           سریع (۰.۵s)، پایدار (تست ۲۰/۲۰ موفق)
         - udf/history فقط به عنوان fallback
         - cache ۵ ثانیه‌ای برای لیست کامل مارکت‌ها
+
+  📌 تغییر جدید این نسخه:
+     متد get_price_at_time() اضافه شد — برای گرفتن high/low کندل صرافی
+     در زمان مشخص (timestamp میلی‌ثانیه). این متد توسط main.py صدا زده
+     می‌شود تا برای هر پیوت تشخیص‌داده‌شده توسط بایننس، قیمت متناظر همان
+     لحظه در صرافی استخراج شود. نتیجه: stop/target با قیمت صرافی محاسبه
+     می‌شود نه بایننس — که با آنچه کاربر در چارت صرافی می‌بیند هم‌خوان است.
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 """
 
@@ -354,6 +361,86 @@ class MarketData:
 
         return None
 
+    # ------------------------------------------------------------------
+    # گرفتن high/low صرافی در زمان مشخص (برای پیوت‌های بایننس)
+    # ------------------------------------------------------------------
+    def get_price_at_time(self, symbol: str, ts_ms: int, price_type: str = "high") -> Optional[float]:
+        """گرفتن high یا low کندل صرافی در زمان مشخص (timestamp میلی‌ثانیه).
+
+        هدف: وقتی موتور تشخیص سیگنال روی بایننس اجرا می‌شود و پیوت‌ها را
+        در زمان‌های مشخصی تشخیص می‌دهد، این متد همان زمان‌ها را می‌گیرد و
+        در صرافی مقصد جستجو می‌کند تا high/low متناظر را پیدا کند.
+
+        نتیجه: stop/target با قیمت صرافی محاسبه می‌شود (نه بایننس)، که با
+        آنچه کاربر در چارت صرافی می‌بیند هم‌خوان است.
+
+        Args:
+            symbol: نماد (مثل "ARBUSDT")
+            ts_ms: timestamp به میلی‌ثانیه (از df.index[pos].timestamp() * 1000)
+            price_type: "high" یا "low"
+
+        Returns:
+            قیمت high/low کندل متناظر، یا None اگه پیدا نشد.
+        """
+        if price_type not in ("high", "low"):
+            logger.warning(f"[PRICE-AT-TIME] {symbol}: price_type نامعتبر '{price_type}'")
+            return None
+
+        try:
+            target_s = ts_ms // 1000
+            # پنجره‌ی کوچک: ۲ دقیقه قبل و ۲ دقیقه بعد از زمان هدف
+            from_s = target_s - 120
+            to_s = target_s + 120
+
+            uri = (
+                f"/futures/udf/history?symbol={symbol.upper()}&resolution=1"
+                f"&from={from_s}&to={to_s}&countback=5"
+            )
+            r = self.session.get(f"{self.base_url}{uri}", timeout=10)
+            r.raise_for_status()
+            data = r.json()
+
+            if not data or data.get("s") != "ok":
+                logger.warning(
+                    f"[PRICE-AT-TIME] {symbol}: پاسخ صرافی نامعتبر "
+                    f"(s={data.get('s') if data else None})"
+                )
+                return None
+
+            timestamps = data.get("t", [])
+            if not timestamps:
+                logger.warning(f"[PRICE-AT-TIME] {symbol}: هیچ کندلی در بازه نیومد")
+                return None
+
+            prices_key = "h" if price_type == "high" else "l"
+            prices = data.get(prices_key, [])
+            if len(prices) != len(timestamps):
+                logger.warning(f"[PRICE-AT-TIME] {symbol}: طول آرایه‌های t و {prices_key} یکی نیست")
+                return None
+
+            # نزدیک‌ترین کندل به زمان هدف
+            best_idx = min(range(len(timestamps)), key=lambda i: abs(timestamps[i] - target_s))
+            time_diff = abs(timestamps[best_idx] - target_s)
+
+            # اگه نزدیک‌ترین کندل بیش از ۲ دقیقه فاصله داره، قابل اعتماد نیست
+            if time_diff > 120:
+                logger.warning(
+                    f"[PRICE-AT-TIME] {symbol}: نزدیک‌ترین کندل {time_diff}s فاصله داره "
+                    f"(از {target_s} خواسته شده بود) — رد شد"
+                )
+                return None
+
+            price = float(prices[best_idx])
+            logger.info(
+                f"[PRICE-AT-TIME] {symbol}: {price_type}={price:.6f} "
+                f"(کندل {timestamps[best_idx]}، فاصله {time_diff}s)"
+            )
+            return price
+
+        except Exception as e:
+            logger.warning(f"[PRICE-AT-TIME] {symbol}: خطا در گرفتن {price_type}: {e}")
+            return None
+
 
 # ═══════════════════════════════════════════════════════════════════
 # اتصال خصوصی صرافی (سفارش/موجودی)
@@ -457,3 +544,15 @@ class PrivateExchange:
             raise
         except Exception as e:
             raise ExchangeError(str(e))
+
+    def update_position_sl(self, position_id, symbol, stop_loss, take_profit=None):
+        """ریسک‌فری: جابه‌جایی حد ضرر یک پوزیشن باز به نقطه‌ی سر‌به‌سر."""
+        prec = PRICE_PRECISION.get(symbol.upper(), 2)
+        body = {
+            "stopLoss": f"{self._round_price(stop_loss, symbol):.{prec}f}",
+            "stopLossStrategy": "LATEST_PRICE",
+            "stopLossOrderType": "STOP_MARKET",
+        }
+        if take_profit is not None:
+            body["takeProfit"] = f"{self._round_price(take_profit, symbol):.{prec}f}"
+        return self._request("PATCH", f"/futures/positions/{position_id}/tpsl", body)
