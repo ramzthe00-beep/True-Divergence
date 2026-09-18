@@ -345,6 +345,8 @@ class LabelEvent:
     ref_price_1: Optional[float] = None   # قیمتِ واقعیِ پیوتِ قبلی (نه بارِ باگ‌دار)
     ref_price_2: Optional[float] = None   # قیمتِ پیوتِ جدید
     pivot_ts: Optional[str] = None        # زمانِ خودِ کندلِ پیوت (pos)
+    pivot_ts_1_ms: Optional[int] = None   # ← جدید: timestamp میلی‌ثانیه‌ی پیوت قبلی
+    pivot_ts_2_ms: Optional[int] = None   # ← جدید: timestamp میلی‌ثانیه‌ی پیوت جدید
 
 
 @dataclass
@@ -496,6 +498,8 @@ class DivergenceEngine:
                                 score=score, stars=_score_stars(score),
                                 ref_price_1=prev_ph["price"], ref_price_2=c_hi,
                                 pivot_ts=str(df.index[pos]),
+                                pivot_ts_1_ms=int(prev_ph["ts"].timestamp() * 1000),
+                                pivot_ts_2_ms=int(df.index[pos].timestamp() * 1000),
                             ))
                     elif c_hi < prev_ph["price"]:
                         hid = (c_hi_rsi > prev_ph["rsi"]) or (c_hi_mcd > prev_ph["macd"])
@@ -507,6 +511,8 @@ class DivergenceEngine:
                                 extra_text="~واگرایی مخفی↓",
                                 ref_price_1=prev_ph["price"], ref_price_2=c_hi,
                                 pivot_ts=str(df.index[pos]),
+                                pivot_ts_1_ms=int(prev_ph["ts"].timestamp() * 1000),
+                                pivot_ts_2_ms=int(df.index[pos].timestamp() * 1000),
                             ))
 
                 # ★ بدون قید‌وشرط — دقیقاً مثل پاین: p_hi := c_hi
@@ -540,6 +546,8 @@ class DivergenceEngine:
                                 score=score, stars=_score_stars(score),
                                 ref_price_1=prev_pl["price"], ref_price_2=c_lo,
                                 pivot_ts=str(df.index[pos]),
+                                pivot_ts_1_ms=int(prev_pl["ts"].timestamp() * 1000),
+                                pivot_ts_2_ms=int(df.index[pos].timestamp() * 1000),
                             ))
                     elif c_lo > prev_pl["price"]:
                         hid = (c_lo_rsi < prev_pl["rsi"]) or (c_lo_mcd < prev_pl["macd"])
@@ -551,6 +559,8 @@ class DivergenceEngine:
                                 extra_text="~واگرایی مخفی↑",
                                 ref_price_1=prev_pl["price"], ref_price_2=c_lo,
                                 pivot_ts=str(df.index[pos]),
+                                pivot_ts_1_ms=int(prev_pl["ts"].timestamp() * 1000),
+                                pivot_ts_2_ms=int(df.index[pos].timestamp() * 1000),
                             ))
 
                 self.state.prev_pivot_low = {
