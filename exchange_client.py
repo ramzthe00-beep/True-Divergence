@@ -362,6 +362,68 @@ class MarketData:
 
         return None
 
+    def fetch_current_market_price(self, symbol: str, max_retries: int = 3) -> Optional[float]:
+        """
+        گرفتن قیمت لحظه‌ای بازار از صرافی (real-time lastPrice).
+
+        چرا این تابع لازمه:
+        - fetch_current_price از close آخرین کندل بسته‌شده استفاده می‌کنه
+        - صرافی با تأخیر ۱-۵ دقیقه کندل‌ها رو نشون می‌ده
+        - در نتیجه entry از قیمت واقعی سیگنال فاصله داره
+        - این تابع از /futures/markets/stats که real-time lastPrice می‌ده استفاده می‌کنه
+
+        با ۳ بار retry در صورت خطا.
+        """
+        symbol_upper = symbol.upper()
+
+        for attempt in range(max_retries):
+            try:
+                r = self.session.get(f"{self.base_url}/futures/markets/stats", timeout=10)
+                r.raise_for_status()
+                data = r.json()
+
+                if not isinstance(data, list):
+                    logger.warning(f"[MARKET-PRICE] {symbol}: پاسخ نامعتبر ({type(data)})")
+                    if attempt < max_retries - 1:
+                        time.sleep(1)
+                        continue
+                    return None
+
+                # جستجوی نماد در لیست
+                found_symbol = False
+                for item in data:
+                    if item.get("symbol") == symbol_upper:
+                        found_symbol = True
+                        last_price_str = item.get("lastPrice")
+                        if last_price_str:
+                            price = float(last_price_str)
+                            logger.info(
+                                f"[MARKET-PRICE] {symbol}: lastPrice = {price:.6f} "
+                                f"(تلاش {attempt+1}/{max_retries})"
+                            )
+                            return price
+                        else:
+                            logger.warning(f"[MARKET-PRICE] {symbol}: نماد پیدا شد ولی lastPrice خالیه")
+                            break
+
+                # تمایز بین «نماد پیدا نشد» و «نماد پیدا شد ولی قیمت خالی بود»
+                if not found_symbol:
+                    logger.warning(f"[MARKET-PRICE] {symbol}: نماد در لیست پیدا نشد")
+
+                if attempt < max_retries - 1:
+                    time.sleep(1)
+                    continue
+                return None
+
+            except Exception as e:
+                logger.warning(f"[MARKET-PRICE] {symbol}: تلاش {attempt+1}/{max_retries} خطا: {e}")
+                if attempt < max_retries - 1:
+                    time.sleep(1.5 ** attempt)
+                    continue
+                return None
+
+        return None
+
     # ------------------------------------------------------------------
     # گرفتن high/low صرافی در زمان مشخص (برای پیوت‌های بایننس)
     # ------------------------------------------------------------------
