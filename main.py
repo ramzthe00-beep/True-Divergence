@@ -454,7 +454,7 @@ def process_symbol(symbol, engine: de.DivergenceEngine):
         #    همان صرافی اجرا می‌شود و قیمت بازار می‌تواند کمی فرق داشته باشد.
         #    اگر به هر دلیلی قیمتِ لحظه‌ای صرافیِ اجرا در دسترس نبود،
         #    برای امنیت به همان قیمتِ لحظه‌ی رویداد در بایننس برمی‌گردیم. ──
-        exec_anchor = market.fetch_current_price(symbol)
+        exec_anchor = market.fetch_current_market_price(symbol)
         entry_price = exec_anchor if exec_anchor is not None else event.price_at_signal
         if exec_anchor is None:
             logger.warning(
