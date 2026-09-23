@@ -87,7 +87,7 @@ LEVERAGE_MAP = {
 
 
 # SYMBOLS = ["LTCUSDT", "DOGEUSDT", "ETHUSDT", "ARBUSDT"]
-SYMBOLS = ["ETHUSDT", "BMTUSDT"]
+SYMBOLS = ["ARBUSDT"]
 
 def _precision_from_tick(tick: float) -> int:
     """
