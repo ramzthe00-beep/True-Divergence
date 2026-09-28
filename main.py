@@ -465,8 +465,10 @@ def process_symbol(symbol, engine: de.DivergenceEngine):
         #    (رفعِ باگِ قبلی: تماسِ سنگین با /futures/udf/history برای هر
         #    رویدادِ تاریخیِ استارت، که باعثِ 429 Too Many Requests می‌شد.) ──
         if _first_run:
-            send_signal_message(
-                symbol, event, df_signal, event.price_at_signal, None, None, informational=True
+            # طبق درخواست کاربر: پیام informational به تلگرام نمی‌ره.
+            logger.info(
+                f"[FIRST_RUN-SIGNAL] {symbol} {event.kind} @ {event.timestamp} "
+                f"(informational — بدون پیام تلگرام)"
             )
             continue
 
@@ -533,7 +535,11 @@ def process_symbol(symbol, engine: de.DivergenceEngine):
         stop, target = compute_stop_target(event, entry_price, atr_now, symbol)
 
         if stop is None or target is None:
-            send_signal_message(symbol, event, df_signal, entry_price, stop, target, informational=True)
+            # طبق درخواست کاربر: پیام informational به تلگرام نمی‌ره.
+            logger.info(
+                f"[SKIP-NO-STOP] {symbol} {event.kind} @ {event.timestamp} "
+                f"(stop/target نامعتبر — بدون پیام تلگرام)"
+            )
             continue
 
         # ═══════════════════════════════════════════════════════════
@@ -550,13 +556,12 @@ def process_symbol(symbol, engine: de.DivergenceEngine):
             ct_result = {"allowed": False, "reason": "ct_run_error", "ct_timeframe": "?", "ct_signal": None}
 
         if not ct_result["allowed"]:
-            # CT تأیید نکرد → این سیگنال رد می‌شه
-            notifier.send(
-                f"⏸️ *سیگنال DTM بدون تأیید CT* — `{symbol}`\n"
-                f"🔸 جهت: *{dtm_direction}*\n"
-                f"📊 دلیل: `{ct_result['reason']}`\n"
-                f"🕐 CT تایم‌فریم: `{ct_result['ct_timeframe']}m`\n"
-                f"🕒 {format_iran_time()}"
+            # طبق درخواست کاربر: پیام CT-rejected به تلگرام نمی‌ره.
+            # فقط توی لاگ محلی ثبت می‌شه تا بشه بعداً بررسی کرد.
+            logger.info(
+                f"[CT-REJECT] {symbol} DTM@{SIGNAL_TIMEFRAME}m {dtm_direction} "
+                f"→ CT@{ct_result.get('ct_timeframe', '?')}m "
+                f"reason={ct_result['reason']}"
             )
             continue
 
