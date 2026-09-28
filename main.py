@@ -64,6 +64,8 @@ import divergence_engine as de
 import ssl_hybrid  # noqa: F401  (وابستگیِ غیرمستقیم از طریق divergence_engine)
 import chart_renderer
 from telegram_logger import TelegramNotifier, setup_logging, format_iran_time, format_iran_date
+# 🆕 فیلتر CT (Ichimoku) برای تأیید هم‌جهت سیگنال DTM
+from ct_signal_filter import check_ct_filter, format_ct_filter_log
 
 logger = setup_logging()
 
@@ -409,6 +411,25 @@ _first_run = True
 _signal_counter = 0
 
 
+# ═══════════════════════════════════════════════════════════════════
+# 🆕 Adapter برای فیلتر CT
+# ═══════════════════════════════════════════════════════════════════
+class CTMarketAdapter:
+    """
+    Adapter برای اینکه check_ct_filter بتونه با MarketData کار کنه.
+    check_ct_filter انتظار داره public_data.fetch_ohlcv(symbol, tf) داشته باشه،
+    ولی MarketData ما fetch_ohlcv_binance داره.
+    """
+    def __init__(self, market_instance):
+        self._market = market_instance
+
+    def fetch_ohlcv(self, symbol, timeframe="1", bars_limit=None):
+        return self._market.fetch_ohlcv_binance(symbol, str(timeframe))
+
+
+_ct_adapter = CTMarketAdapter(market)
+
+
 def _next_signal_number():
     global _signal_counter
     _signal_counter += 1
@@ -514,6 +535,37 @@ def process_symbol(symbol, engine: de.DivergenceEngine):
         if stop is None or target is None:
             send_signal_message(symbol, event, df_signal, entry_price, stop, target, informational=True)
             continue
+
+        # ═══════════════════════════════════════════════════════════
+        # 🆕 فیلتر CT — تأیید هم‌جهت
+        # ═══════════════════════════════════════════════════════════
+        dtm_direction = "LONG" if event.direction == "BUY" else "SHORT"
+        try:
+            ct_result = check_ct_filter(
+                _ct_adapter, symbol, dtm_direction, SIGNAL_TIMEFRAME
+            )
+            logger.info(format_ct_filter_log(symbol, dtm_direction, SIGNAL_TIMEFRAME, ct_result))
+        except Exception as e:
+            logger.error(f"[CT-FILTER] {symbol}: خطا در اجرای فیلتر: {e}")
+            ct_result = {"allowed": False, "reason": "ct_run_error", "ct_timeframe": "?", "ct_signal": None}
+
+        if not ct_result["allowed"]:
+            # CT تأیید نکرد → این سیگنال رد می‌شه
+            notifier.send(
+                f"⏸️ *سیگنال DTM بدون تأیید CT* — `{symbol}`\n"
+                f"🔸 جهت: *{dtm_direction}*\n"
+                f"📊 دلیل: `{ct_result['reason']}`\n"
+                f"🕐 CT تایم‌فریم: `{ct_result['ct_timeframe']}m`\n"
+                f"🕒 {format_iran_time()}"
+            )
+            continue
+
+        # ── CT تأیید کرد → ادامه ──
+        _ct_sig = ct_result.get("ct_signal") or {}
+        logger.info(
+            f"[CT-FILTER] {symbol}: ✅ تأیید شد توسط "
+            f"CT {_ct_sig.get('kind', '?')} @ {_ct_sig.get('time_iran', '?')}"
+        )
 
         signal_number = _next_signal_number()
         send_signal_message(symbol, event, df_signal, entry_price, stop, target, signal_number)
