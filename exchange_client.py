@@ -139,12 +139,21 @@ class MarketData:
     # ------------------------------------------------------------------
     # منبع سیگنال: بایننس (عمومی)
     # ------------------------------------------------------------------
-    def fetch_ohlcv_binance(self, symbol: str, timeframe: str = "1") -> pd.DataFrame:
+    def fetch_ohlcv_binance(self, symbol: str, timeframe: str = "1", timeout: int = 8) -> pd.DataFrame:
         """
         timeframe به‌سبکِ عددِ خامِ دقیقه ("1","5","15",...) پذیرفته می‌شود
         تا با بقیه‌ی پروژه (و main.py) هماهنگ بماند؛ داخلاً به فرمت
         interval بایننس ("1m","5m",...) ترجمه می‌شود.
         """
+        # ─── cache بایننس (۳۰ ثانیه) ───
+        if not hasattr(self, "_binance_cache"):
+            self._binance_cache = {}
+        now_ts = time.time()
+        cache_key = f"{symbol.upper()}_{timeframe}"
+        cached_binance = self._binance_cache.get(cache_key)
+        if cached_binance and (now_ts - cached_binance[1]) < self._BINANCE_CACHE_TTL_SEC:
+            return cached_binance[0]
+
         interval_map = {"1": "1m", "5": "5m", "15": "15m", "30": "30m", "60": "1h", "240": "4h"}
         interval = interval_map.get(str(timeframe), f"{timeframe}m")
 
@@ -169,7 +178,7 @@ class MarketData:
                     f"{base}/api/v3/klines?symbol={symbol.upper()}"
                     f"&interval={interval}&startTime={start_ms}&endTime={now_ms}&limit={limit}"
                 )
-                r = self.session.get(url, timeout=15)
+                r = self.session.get(url, timeout=timeout)
                 r.raise_for_status()
                 rows = r.json()
                 if not rows:
@@ -197,6 +206,7 @@ class MarketData:
 
                 self._binance_base_working = base   # کش کن تا دفعه‌ی بعد مستقیم همین base را بزند
                 result = df.tail(self.history_bars)
+                self._binance_cache[cache_key] = (result, now_ts)   # ← ذخیره در cache
                 logger.info(f"Fetched {len(result)} BINANCE-SPOT candles for {symbol} {timeframe}m via {base}")
                 return result
 
@@ -284,6 +294,7 @@ class MarketData:
     # بدون cache = ۲۱۰ درخواست به صرافی (۸۴ ثانیه). با cache = فقط ۱
     # درخواست (۰.۴ ثانیه) — ۲۰۶x سریع‌تر.
     _PRICE_CACHE_TTL_SEC = 90.0
+    _BINANCE_CACHE_TTL_SEC = 30.0   # ← cache بایننس
     _MARKETS_STATS_CACHE_TTL_SEC = 5.0
 
     def fetch_current_price(self, symbol: str, max_retries: int = 2) -> Optional[float]:
